@@ -163,6 +163,47 @@ def relabel_bridge_actions(traj: Dict[str, Any]) -> Dict[str, Any]:
     return traj_truncated
 
 
+def relabel_ur454_actions(traj: Dict[str, Any]) -> Dict[str, Any]:
+    """Relabels actions to use reached proprioceptive state; discards last timestep (no-action)."""
+    
+    # Process movement actions (first 6 elements of state)
+    movement_actions = traj["observation"]["state"][1:, :6] - traj["observation"]["state"][:-1, :6]
+    
+    # Process gripper actions (7th element of state, index 6)
+    gripper_states = traj["observation"]["state"][:, 6]
+    gripper_diffs = gripper_states[1:] - gripper_states[:-1]
+    
+    # Threshold for considering changes as "similar"
+    similarity_threshold = 0.01
+    
+    # Initialize binary actions tensor for gripper state
+    gripper_binary = tf.TensorArray(dtype=tf.float32, size=tf.shape(gripper_states)[0])
+    
+    # Start with the assumption that the gripper is opening (1.0)
+    last_action = 1.0
+    gripper_binary = gripper_binary.write(0, last_action)
+
+    # Determine gripper actions based on increase, decrease, or similarity
+    for i in range(tf.shape(gripper_diffs)[0]):
+        if gripper_diffs[i] > similarity_threshold:
+            last_action = 1.0  # Opening
+        elif gripper_diffs[i] < -similarity_threshold:
+            last_action = 0.0  # Closing
+        # If the difference is small (within similarity threshold), keep the previous action
+
+        # Store the determined action
+        gripper_binary = gripper_binary.write(i + 1, last_action)
+    
+    # Convert gripper binary actions to tensor
+    gripper_binary = gripper_binary.stack()[:-1]  # Discard the last timestep to match movement actions
+    
+    # Combine movement actions and gripper actions
+    traj_truncated = tf.nest.map_structure(lambda x: x[:-1], traj)
+    traj_truncated["action"] = tf.concat([movement_actions, gripper_binary[:, None]], axis=1)
+
+    return traj_truncated
+
+
 # === RLDS Dataset Initialization Utilities ===
 def pprint_data_mixture(dataset_kwargs_list: List[Dict[str, Any]], dataset_weights: List[int]) -> None:
     print("\n######################################################################################")

@@ -73,7 +73,7 @@ def detect_robot_platform():
         return "BRIDGE"
     else:
         # Default to LIBERO if unclear
-        return "LIBERO"
+        return "UR"
 
 
 # Determine which robot platform to use

@@ -112,7 +112,7 @@ def resize_image_for_preprocessing(img):
     """
     ALOHA_PREPROCESS_SIZE = 256
     img = np.array(
-        Image.fromarray(img).resize((ALOHA_PREPROCESS_SIZE, ALOHA_PREPROCESS_SIZE), resample=Image.BICUBIC)
+        Image.fromarray(img).resize((ALOHA_PREPROCESS_SIZE, ALOHA_PREPROCESS_SIZE), resample=Image.LANCZOS)
     )  # BICUBIC is default; specify explicitly to make it clear
     return img
 

@@ -25,6 +25,7 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
     invert_gripper_actions,
     rel2abs_gripper_actions,
     relabel_bridge_actions,
+    relabel_ur454_actions,
 )
 
 
@@ -846,7 +847,10 @@ def aloha_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     return trajectory
 
 def ur_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    # Don't need to do anything because dataset is already in the correct format
+    trajectory["observation"]["EEF_state"] = trajectory["observation"]["state"][:, :6]
+    trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -1:]
+    
+    trajectory = relabel_ur454_actions(trajectory)
     return trajectory
 
 
@@ -935,5 +939,5 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "aloha1_scoop_X_into_bowl_45_demos": aloha_dataset_transform,
     "aloha1_put_X_into_pot_300_demos": aloha_dataset_transform,
     ### UR fine-tuning datasets
-    "ur454_put_X_into_plate": ur_dataset_transform
+    "ur454_dataset": ur_dataset_transform
 }
