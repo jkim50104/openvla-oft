@@ -1,0 +1,10 @@
+opencv-python==4.11.0.86
+ur-rtde==1.6.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+gym==0.26.2
+scikit-image==0.25.2
+
+
+# conda install -c conda-forge libffi
+# conda install -c conda-forge libstdcxx-ng>=12

@@ -892,7 +892,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16=True,
+            to_bf16=False, # QuadroRTX 8000 does not support bf16
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -908,7 +908,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps": cfg.num_diffusion_steps,
             },
-            to_bf16=True,
+            to_bf16=False,
         )
         noisy_action_projector = init_module(
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
