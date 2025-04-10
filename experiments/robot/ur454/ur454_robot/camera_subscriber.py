@@ -4,8 +4,8 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 class CameraSubscriber(Node):
-    def __init__(self, topic="/camera/camera/color/image_raw"):
-        super().__init__('camera_subscriber')
+    def __init__(self, topic="/camera/camera/color/image_raw", node_name="camera_subscriber"):
+        super().__init__(node_name)
         self.bridge = CvBridge()
         self.image = None
         self.lock = threading.Lock()
@@ -27,4 +27,6 @@ class CameraSubscriber(Node):
 
     def get_image(self):
         with self.lock:
-            return self.image.copy() if self.image is not None else None
+            image_copy = self.image.copy() if self.image is not None else None
+            self.image = None  # clear buffer after fetching
+        return image_copy

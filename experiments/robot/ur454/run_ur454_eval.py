@@ -15,13 +15,13 @@ from pathlib import Path
 from typing import Optional, List, Union
 import cv2
 import tensorflow_datasets as tfds
+import numpy as np
 
 import draccus
 import tqdm
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append(".")
-print(sys.path)
 from experiments.robot.ur454.ur454_utils import (
     get_ur_env,
     get_ur_image,
@@ -71,11 +71,11 @@ class GenerateConfig:
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
-    num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
+    num_images_in_input: int = 2                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
-    num_open_loop_steps: int = 25                    # Number of actions to execute open-loop before requerying policy
+    num_open_loop_steps: int = 10                    # Number of actions to execute open-loop before requerying policy
 
     unnorm_key: Union[str, Path] = ""                # Action un-normalization key
     use_relative_actions: bool = False               # Whether to use relative actions (delta joint angles)
@@ -98,20 +98,19 @@ class GenerateConfig:
     # Note: Setting initial orientation with a 30 degree offset, which makes the robot appear more natural
     init_ee_pos: List[float] = field(default_factory=lambda: [0.105, -0.372, 0.337])
     init_ee_rot: List[float] = field(default_factory=lambda: [-2.203, 2.235, -0.000])
-    init_jpos: List[float] = field(default_factory=lambda: [1.060, -1.411, 1.898, -2.054, -1.564, 4.220, 0])
-    bounds: List[List[float]] = field(default_factory=lambda: [
-            [0.1, -0.20, -0.01, -1.57, 0],
-            [0.45, 0.25, 0.30, 1.57, 0],
-        ]
-    )
+    init_jpos: List[float] = field(default_factory=lambda: [1.060, -1.411, 1.898, -2.054, -1.564, 4.220])
 
-    camera_topics = ["/cam1/cam1/color/image_raw", "/cam2/cam2/color/image_raw"]
-    control_frequency: float = 5
+    camera_topics = ["/cam1/cam1/color/image_raw",
+                     "/cam2/cam2/color/image_raw"]
+    control_frequency: float = 10
 
     #################################################################################################################
     # Utils
     #################################################################################################################
+    run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
+    local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
     seed: int = 7                                    # Random Seed (for reproducibility)
+
     save_video: bool = False
     sanity_check: bool = False
     # fmt: on
@@ -194,7 +193,7 @@ def prepare_observation(obs, resize_size):
     """Prepare observation for policy input."""
     # Get preprocessed images
     img = get_ur_image(obs)
-    wrist_img, = get_ur_wrist_images(obs)
+    wrist_img = get_ur_wrist_images(obs)
 
     # Resize images to size expected by model
     img_resized = resize_image_for_policy(img, resize_size)
@@ -204,7 +203,7 @@ def prepare_observation(obs, resize_size):
     observation = {
         "full_image": img_resized,
         "wrist_image": wrist_img_resized,
-        "state": obs.observation["qpos"],
+        "state": obs["state"]
     }
 
     return observation, img_resized, wrist_img_resized
@@ -241,9 +240,6 @@ def run_episode(
     log_message("Prepare the scene, and then press Enter to begin...", log_file)
     input()
 
-    # Reset environment again to fetch first timestep observation
-    obs = env.reset()
-
     # Fetch initial robot state (but sleep first so that robot stops moving)
     time.sleep(1)
     curr_state = env.get_tpos()
@@ -263,15 +259,15 @@ def run_episode(
                 obs["full_image"] = next(steps)["observation"]["image"].numpy()
 
             # print("[INFO] Curruent UR5 state:", obs["state"])
-            cv2.imshow("Realsense View", obs["full_image"])
-            key = cv2.waitKey(1) & 0xFF
+            cv2.imshow("Realsense View", np.hstack((obs["full_image"], obs["wrist_image"])))
+            key = cv2.waitKey(1)
 
             if key == ord('q'):  # If 'q' is pressed, exit the loop
                 env.close_env()  # Call your cleanup function
                 break
 
             # Save raw high camera image for replay video
-            replay_images.append(obs.observation["full_image"])
+            replay_images.append(obs["full_image"])
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
@@ -310,13 +306,13 @@ def run_episode(
             # Execute action in environment
             if cfg.use_relative_actions:
                 # Get absolute joint angles from relative action
-                rel_action = action
-                target_state = curr_state + rel_action
-                obs = env.step(target_state.tolist())
+                target_state = curr_state + action[:6]
+                action = np.concatenate([target_state, action[6:]])
+                obs = env.step(action)
                 # Update current state (assume it is the commanded target state)
                 curr_state = target_state
             else:
-                obs = env.step(action.tolist())
+                obs = env.step(action)
             t += 1
 
             # Sleep until next timestep
@@ -335,7 +331,11 @@ def run_episode(
     episode_end_time = time.time()
 
     # Get success feedback from user
-    user_input = input("Success? Enter 'y' or 'n': ")
+    user_input = input("[Enter to terminate] Success? Enter 'y' or 'n': ")
+    if user_input == "":
+        env.close()
+        exit()
+    
     success = True if user_input.lower() == "y" else False
 
     # Calculate episode statistics
@@ -350,16 +350,14 @@ def run_episode(
         episode_stats,
         replay_images,
         replay_images_resized,
-        replay_images_left_wrist_resized,
-        replay_images_right_wrist_resized,
+        replay_images_wrist_resized,
     )
 
 
 def save_episode_videos(
     replay_images,
     replay_images_resized,
-    replay_images_left_wrist,
-    replay_images_right_wrist,
+    replay_images_wrist,
     episode_idx,
     success,
     task_description,
@@ -379,20 +377,12 @@ def save_episode_videos(
         notes="resized",
     )
     save_rollout_video(
-        replay_images_left_wrist,
+        replay_images_wrist,
         episode_idx,
         success=success,
         task_description=task_description,
         log_file=log_file,
-        notes="left_wrist_resized",
-    )
-    save_rollout_video(
-        replay_images_right_wrist,
-        episode_idx,
-        success=success,
-        task_description=task_description,
-        log_file=log_file,
-        notes="right_wrist_resized",
+        notes="wrist_resized",
     )
 
 @draccus.wrap()
@@ -429,13 +419,13 @@ def eval_ur454(cfg: GenerateConfig) -> None:
 
     for episode_idx in tqdm.tqdm(range(cfg.num_rollouts_planned)):
         # Get task description from user
-        task_label = get_next_task_label(task_label)
+        task_description = get_next_task_label(task_description)
         log_message(f"\nTask: {task_description}", log_file)
 
         log_message(f"Starting episode {num_rollouts_completed + 1}...", log_file)
 
         # Run episode
-        episode_stats, replay_images, replay_images_resized, replay_images_left_wrist, replay_images_right_wrist = (
+        episode_stats, replay_images, replay_images_resized, replay_images_wrist = (
             run_episode(cfg, env, task_description, 
                         model, action_head, proprio_projector, noisy_action_projector, processor, 
                         resize_size, log_file)
@@ -450,8 +440,7 @@ def eval_ur454(cfg: GenerateConfig) -> None:
         save_episode_videos(
             replay_images,
             replay_images_resized,
-            replay_images_left_wrist,
-            replay_images_right_wrist,
+            replay_images_wrist,
             num_rollouts_completed,
             episode_stats["success"],
             task_description,

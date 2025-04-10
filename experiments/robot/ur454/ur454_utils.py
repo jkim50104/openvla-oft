@@ -28,7 +28,6 @@ np.set_printoptions(formatter={"float": lambda x: "{0:0.2f}".format(x)})
 
 def get_ur_env_params(cfg):
     env_params = {}
-    env_params["override_workspace_boundaries"] = cfg.bounds
     env_params["camera_topics"] = cfg.camera_topics
     env_params["return_full_image"] = True
 
@@ -46,8 +45,7 @@ def get_ur_env(cfg):
     env_params = get_ur_env_params(cfg)
     
     # Connect to UR
-    ur_client = URClient(host=cfg.host_ip)
-    ur_client.init(env_params)
+    ur_client = URClient(host=cfg.host_ip, env_params=env_params)
     env = URGym(
         ur_client,
         cfg=cfg,
@@ -126,6 +124,6 @@ def get_ur_image(obs):
 
 def get_ur_wrist_images(obs):
     """Extracts both wrist camera images from observations and preprocesses them."""
-    wrist_img = obs.observation["wrist_image"]
+    wrist_img = obs["wrist_image"]
     wrist_img = resize_image_for_preprocessing(wrist_img)
     return wrist_img

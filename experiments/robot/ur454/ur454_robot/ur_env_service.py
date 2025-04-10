@@ -3,6 +3,8 @@ import cv2
 from skimage.transform import resize
 import threading
 import rclpy
+from rclpy.executors import SingleThreadedExecutor
+import signal
 from rtde_control import RTDEControlInterface
 from rtde_receive import RTDEReceiveInterface
 
@@ -10,35 +12,51 @@ from ur454_robot.robotiq_gripper_control import RobotiqGripper
 from ur454_robot.camera_subscriber import CameraSubscriber
 
 class URClient():
-    def __init__(self, host):        
+    def __init__(self, host, env_params):
         self.host = host
+        self.return_full_image = env_params.get("return_full_image", False)
+        self.start_state = env_params.get("start_state")
+        self.start_jpos = env_params.get("start_jpos")
+        self.speed = env_params.get("speed", 0.25)
+        self.acceleration = env_params.get("acceleration", 0.5)
+        self.camera_topics = env_params["camera_topics"]
 
-    def init(self, env_params):
-        self.bounds = env_params["override_workspace_boundaries"]
-        self.return_full_image = env_params["return_full_image"]
-        self.start_state = env_params["start_state"]
-        self.start_jpos = env_params["start_jpos"]
+        self._initialize_robot()
 
-        # Initialize ROS 2
+    def _initialize_cam(self):
+        # signal.signal(signal.SIGINT, signal.SIG_DFL)
+        # if not self.cam_init:
         rclpy.init()
-        self.cam_node = CameraSubscriber(topic=env_params["camera_topics"])
-        self.executor = rclpy.executors.SingleThreadedExecutor()
-        self.executor.add_node(self.cam_node)
+        self.executor = SingleThreadedExecutor()
 
-        # Spin ROS in a background thread
-        def ros_spin():
-            while rclpy.ok():
-                self.executor.spin_once(timeout_sec=0.01)
+        self.cam_nodes = [
+            CameraSubscriber(topic=topic, node_name=f"camera_subscriber_{idx+1}")
+            for idx, topic in enumerate(self.camera_topics)
+        ]
 
-        self.ros_thread = threading.Thread(target=ros_spin, daemon=True)
+        for node in self.cam_nodes:
+            self.executor.add_node(node)
+
+        self.ros_thread = threading.Thread(target=self._spin_ros, daemon=True)
         self.ros_thread.start()
 
-        # Connect to UR
+    def _spin_ros(self):
+        while rclpy.ok():
+            try:
+                self.executor.spin_once(timeout_sec=0.01)
+            except Exception as e:
+                print(f"[ROS Spin Error]: {e}")
+                for node in self.cam_nodes:
+                    node.destroy_node()
+                try:                
+                    rclpy.shutdown()
+                except:
+                    print("[rclpy shutdown error]")
+                print("🛑 Cleaning up ROS2 cam nodes...")
+
+    def _initialize_robot(self):
         self.rtde_c = RTDEControlInterface(self.host)
         self.rtde_r = RTDEReceiveInterface(self.host)
-        self.speed = env_params["speed"]
-        self.acceleration = env_params["acceleration"]
-
         self.gripper = RobotiqGripper(self.rtde_c, self.rtde_r)
     
     def _get_processed_image(self, image=None, image_size=256):
@@ -46,16 +64,20 @@ class URClient():
         return downsampled_trimmed_image
     
     def _get_observation(self):
-        image = self.cam_node.get_image() #dtype = np.uint8
-        if image is None:
+        image1 = self.cam_nodes[0].get_image()  # dtype = np.uint8
+        image2 = self.cam_nodes[1].get_image()
+
+        if image1 is None or image2 is None:
             return None
-        
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = cv2.cvtColor(image1, cv2.COLOR_BGR2RGB)
+        image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2RGB)
+
         obs = {
-            "full_image": image,
-            "wrist_image": image,
-            "state": np.concatenate(self._get_tcp_pos(), self._get_gripper_pos()), # [x,y,z,rx,ry,rz,gripper]
-            # "state": np.concatenate(self._get_qpos(), self._get_gripper_pos()) # [6D joints, gripper]
+            "full_image": image1,
+            "wrist_image": image2,
+            "state": np.concatenate([self._get_tcp_pos(), self._get_gripper_pos()]),  # [x,y,z,rx,ry,rz,gripper]
+            # "state": np.concatenate([self._get_qpos(), self._get_gripper_pos()]) # [6D joints, gripper]
         }
 
         return obs
@@ -71,7 +93,7 @@ class URClient():
         return np.array(self.rtde_r.getActualQ())
     
     def _get_gripper_pos(self):
-        return np.array(self.gripper.get_gripper_position() / self.gripper.max_range) # gripper pose normalize
+        return np.array([self.gripper.get_gripper_position() / self.gripper.max_range]) # gripper pose normalize
     
     def step_action(self, action):
         self.moveL(action[:6])  # Move to this new pose        
@@ -88,10 +110,14 @@ class URClient():
             self.gripper.open()
         else:
             self.gripper.close()
-            
+
     def close(self):
-        print("🛑 Shutting down URCLient and ROS2...")        
+        print("🛑 Shutting down URClient and ROS2...")        
         self.rtde_c.stopScript()
-        self.cam_node.destroy_node()
+
+        for node in self.cam_nodes:
+            node.destroy_node()
+
+        self.executor.shutdown()
         rclpy.shutdown()
         cv2.destroyAllWindows()

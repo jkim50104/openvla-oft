@@ -150,6 +150,7 @@ data
 data/
 runs
 runs/
+experiments/logs/
 
 # Rollout videos and wandb logs
 rollouts/

@@ -9,6 +9,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rtde_control import RTDEControlInterface
 from rtde_receive import RTDEReceiveInterface
+from rclpy.executors import SingleThreadedExecutor
 
 import sys
 sys.path.append('/home/jokim/projects/openvla-oft/experiments/robot/ur454')
@@ -46,12 +47,17 @@ class CameraSubscriber(Node):
 def main():
     # UR IP
     ROBOT_IP = "192.168.0.3"
+    camera_topics = ["/cam1/cam1/color/image_raw",
+                     "/cam2/cam2/color/image_raw"]
 
     # Initialize ROS 2
     rclpy.init()
-    cam_node = CameraSubscriber()
-    executor = rclpy.executors.SingleThreadedExecutor()
-    executor.add_node(cam_node)
+
+    executor = SingleThreadedExecutor()
+    cam_nodes = [CameraSubscriber(topic=topic) for topic in camera_topics]
+
+    for node in cam_nodes:
+        executor.add_node(node)
 
     # Spin ROS in a background thread
     def ros_spin():
@@ -88,9 +94,10 @@ def main():
             rtde_c.moveL(pose, speed=0.25, acceleration=0.5)
             time.sleep(1)
 
-            image = cam_node.get_image()
-            if image is not None:
-                cv2.imshow("Realsense View", image)
+            image1 = cam_nodes[0].get_image()  # dtype = np.uint8
+            image2 = cam_nodes[1].get_image()
+            if image1 is not None and image2 is not None:
+                cv2.imshow("Realsense View", np.hstack((image1, image2)))
                 cv2.waitKey(500)  # Display for 0.5 seconds
             else:
                 print("⚠️ No image received yet.")
@@ -106,9 +113,11 @@ def main():
 
     finally:
         rtde_c.stopScript()
-        cam_node.destroy_node()
+        for cam_node in cam_nodes:
+            cam_node.destroy_node()
         rclpy.shutdown()
         cv2.destroyAllWindows()
+        print("Cleaning ROS")
 
 
 if __name__ == "__main__":

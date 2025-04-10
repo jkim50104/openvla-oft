@@ -37,7 +37,7 @@ class URGym(gym.Env):
         self.observation_space = gym.spaces.Dict({
             "full_image": gym.spaces.Box(low=0, high=255, shape=(480, 640, 3), dtype=np.uint8),
             "wrist_image": gym.spaces.Box(low=0, high=255, shape=(480, 640, 3), dtype=np.uint8),
-            "proprio": gym.spaces.Box(low=np.ones((7,)) * -1, high=np.ones((8,)), dtype=np.float64),
+            "proprio": gym.spaces.Box(low=np.ones((7,)) * -1, high=np.ones((7,)), dtype=np.float64),
         })
 
         self.action_space = gym.spaces.Box(low=np.zeros((7,)), high=np.ones((7,)), dtype=np.float64)
@@ -51,8 +51,8 @@ class URGym(gym.Env):
 
         return obs
 
-    def reset(self, seed=None, options=None):
-        #self.ur_client.reset()
+    def reset(self, seed=None):
+        self.ur_client._initialize_cam()
         self.move_to_start_state()
 
         super().reset(seed=seed)
