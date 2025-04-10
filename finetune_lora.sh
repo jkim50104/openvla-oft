@@ -30,5 +30,5 @@ CUDA_VISIBLE_DEVICES=${DEVICE} torchrun --standalone --nnodes 1 --nproc-per-node
 
   # Use film if there are multiple language types
 
-  scp -r "runs/openvla-7b+ur454_dataset+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug--$RUN_ID_NOTE" levine:/home/jokim/projects/openvla/runs
+  scp -r "runs/openvla-7b+ur454_dataset+b4+lr-0.0005+lora-r32+dropout-0.0--image_aug--$RUN_ID_NOTE" levine:/home/jokim/projects/openvla-oft/runs
   
