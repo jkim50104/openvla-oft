@@ -92,8 +92,8 @@ class GenerateConfig:
     use_relative_actions: bool = True               # Whether to use relative actions (delta joint angles)
 
     host_ip: str = "192.168.0.3"
-    speed: float = 0.25
-    acceleration: float = 0.5
+    speed: float = 1. #0.25
+    acceleration: float = 1. #0.5
 
     # Note: Setting initial orientation with a 30 degree offset, which makes the robot appear more natural
     init_ee_pos: List[float] = field(default_factory=lambda: [0.105, -0.372, 0.337])
@@ -365,25 +365,31 @@ def save_episode_videos(
 ):
     """Save videos of the episode from different camera angles."""
     # Save main replay video
-    save_rollout_video(replay_images, episode_idx, success=success, task_description=task_description, log_file=log_file)
+    if success:
+        save_rollout_video(
+            replay_images, 
+            episode_idx, 
+            success=success, 
+            task_description=task_description, 
+            log_file=log_file)
 
-    # Save processed view videos
-    save_rollout_video(
-        replay_images_resized,
-        episode_idx,
-        success=success,
-        task_description=task_description,
-        log_file=log_file,
-        notes="resized",
-    )
-    save_rollout_video(
-        replay_images_wrist,
-        episode_idx,
-        success=success,
-        task_description=task_description,
-        log_file=log_file,
-        notes="wrist_resized",
-    )
+    # # Save processed view videos
+    # save_rollout_video(
+    #     replay_images_resized,
+    #     episode_idx,
+    #     success=success,
+    #     task_description=task_description,
+    #     log_file=log_file,
+    #     notes="resized",
+    # )
+    # save_rollout_video(
+    #     replay_images_wrist,
+    #     episode_idx,
+    #     success=success,
+    #     task_description=task_description,
+    #     log_file=log_file,
+    #     notes="wrist_resized",
+    # )
 
 @draccus.wrap()
 def eval_ur454(cfg: GenerateConfig) -> None:
@@ -413,13 +419,18 @@ def eval_ur454(cfg: GenerateConfig) -> None:
     print("[INFO] Start evaluating in ur454")
     # Start evaluation
     # Pick up the bannana 
-    task_description = "put the banana to the yellow plate" #banana, strawberry
+    task_description = "" #"put the banana to the yellow plate" #banana, strawberry
 
     num_rollouts_completed, total_successes = 0, 0
 
     for episode_idx in tqdm.tqdm(range(cfg.num_rollouts_planned)):
         # Get task description from user
         task_description = get_next_task_label(task_description)
+
+        if task_description == "q":
+            print("[INFO] Finishing experiment early.")
+            break
+
         log_message(f"\nTask: {task_description}", log_file)
 
         log_message(f"Starting episode {num_rollouts_completed + 1}...", log_file)

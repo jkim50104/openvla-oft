@@ -923,8 +923,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if action_head is not None:
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
+            print("normalized_actions in function:", normalized_actions)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            print("normalized_actions in function:", normalized_actions)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
+            print("normalized_actions in function:", normalized_actions)
         else:
             # Discrete token-based prediction
             predicted_action_token_ids = (
@@ -1054,8 +1057,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 action_head,
             )
 
-        # Unnormalize predicted actions
+        # Unnormalize predicted actions        
+        print("normalized_actions:", normalized_actions)
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+        print("unnormalized_actions:", normalized_actions)
 
         return actions, actions_hidden_states
 

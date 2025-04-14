@@ -112,12 +112,12 @@ class URClient():
             self.gripper.close()
 
     def close(self):
-        print("🛑 Shutting down URClient and ROS2...")        
+        print("🛑 Shutting down URClient and ROS2...")     
+        cv2.destroyAllWindows()
+
         self.rtde_c.stopScript()
 
         for node in self.cam_nodes:
             node.destroy_node()
-
         self.executor.shutdown()
         rclpy.shutdown()
-        cv2.destroyAllWindows()

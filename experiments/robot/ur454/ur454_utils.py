@@ -57,31 +57,24 @@ def get_next_task_label(task_label):
     if task_label == "":
         user_input = ""
         while user_input == "":
-            user_input = input("Enter the task name: ")
+            user_input = get_task_shortcut("Enter the task name: ")
         task_label = user_input
-    # else:
-    #     user_input = input("Enter the task name (or leave blank to repeat the previous task): ")
-    #     if user_input == "":
-    #         pass  # Do nothing -> Let task_label be the same
-    #     else:
-    #         task_label = user_input
+    else:
+        user_input = get_task_shortcut("Enter the task name (or leave blank to repeat the previous task): ")
+        if user_input == "":
+            pass  # Do nothing -> Let task_label be the same
+        else:
+            task_label = user_input
     print(f"Task: {task_label}")
     return task_label
 
-
-def save_rollout_video(rollout_images, idx):
-    """Saves an MP4 replay of an episode."""
-    os.makedirs("./rollouts", exist_ok=True)
-    mp4_path = f"./rollouts/rollout-{DATE_TIME}-{idx+1}.mp4"
-    
-    # Use the 'ffmpeg' plugin with proper fps setting
-    video_writer = imageio.get_writer(mp4_path, fps=5, codec='libx264', format='FFMPEG')
-    
-    for img in rollout_images:
-        video_writer.append_data(img)
-    
-    video_writer.close()
-    print(f"Saved rollout MP4 at path {mp4_path}")
+def get_task_shortcut(description):
+    user_input = input(description)
+    if user_input == "pb":
+        user_input = "put the banana to the yellow plate"
+    elif user_input == "pf": 
+        user_input = "put the fish to the yellow plate"
+    return user_input
 
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, notes=None):
@@ -93,7 +86,7 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     if notes is not None:
         filetag += f"--{notes}"
     mp4_path = f"{filetag}.mp4"
-    video_writer = imageio.get_writer(mp4_path, fps=25)
+    video_writer = imageio.get_writer(mp4_path, fps=10)
     for img in rollout_images:
         video_writer.append_data(img)
     video_writer.close()

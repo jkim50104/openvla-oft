@@ -77,8 +77,7 @@ class URGym(gym.Env):
             try:
                 # self.ur_client.move(self.ur_client.start_state)
                 self.ur_client.moveJ(self.ur_client.start_jpos)
-                # self.ur_client.move_gripper(0)
-                # self.ur_client.move_gripper(1)
+                self.ur_client.move_gripper(1)
                 successful = True
             except Exception as e:
                 print(e)
