@@ -151,8 +151,7 @@ data/
 runs
 runs/
 experiments/logs/
-third_party2/
-third_party/Streaming-Grounded-SAM-2
+third_party/
 
 # Rollout videos and wandb logs
 rollouts/
