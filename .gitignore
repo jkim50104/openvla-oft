@@ -154,6 +154,7 @@ experiments/logs/
 vla*.txt
 
 # Third party
+third_party/Streaming-Grounded-SAM-2_org
 third_party/Streaming-Grounded-SAM-2/.vscode/
 third_party/Streaming-Grounded-SAM-2/.DS_Store
 third_party/Streaming-Grounded-SAM-2/__pycache__/
