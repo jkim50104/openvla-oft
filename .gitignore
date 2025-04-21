@@ -153,29 +153,6 @@ runs/
 experiments/logs/
 vla*.txt
 
-# Third party
-third_party/Streaming-Grounded-SAM-2_org
-third_party/Streaming-Grounded-SAM-2/.vscode/
-third_party/Streaming-Grounded-SAM-2/.DS_Store
-third_party/Streaming-Grounded-SAM-2/__pycache__/
-third_party/Streaming-Grounded-SAM-2/*-checkpoint.ipynb
-third_party/Streaming-Grounded-SAM-2/.venv
-third_party/Streaming-Grounded-SAM-2/.env
-third_party/Streaming-Grounded-SAM-2/*.egg*
-third_party/Streaming-Grounded-SAM-2/build/*
-third_party/Streaming-Grounded-SAM-2/_C.*
-third_party/Streaming-Grounded-SAM-2/outputs/*
-third_party/Streaming-Grounded-SAM-2/checkpoints/*.pt
-third_party/Streaming-Grounded-SAM-2/gdino_checkpoints/*.pth
-third_party/Streaming-Grounded-SAM-2/gdino_checkpoints/grounding-dino*
-third_party/Streaming-Grounded-SAM-2/llm_checkpoints/Qwen2*
-third_party/Streaming-Grounded-SAM-2/*.gif
-third_party/Streaming-Grounded-SAM-2/*.mp4
-third_party/Streaming-Grounded-SAM-2/notebooks/images
-third_party/Streaming-Grounded-SAM-2/notebooks/videos
-third_party/Streaming-Grounded-SAM-2/grounding_dino/.asset
-third_party/Streaming-Grounded-SAM-2/grounding_dino/demo
-
 # Rollout videos and wandb logs
 rollouts/
 wandb/
