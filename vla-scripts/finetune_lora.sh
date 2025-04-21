@@ -1,7 +1,7 @@
 set -e  # ⬅️ Exit on error
 
 # RUN_ID_NOTE="parallel_dec--10_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state"
-RUN_ID_NOTE="pb_pf"
+RUN_ID_NOTE="DUMMY_FOR_VISION_DEV" #"pb_pf"
 
 # export NCCL_P2P_LEVEL=NVL
 
@@ -13,8 +13,8 @@ CUDA_VISIBLE_DEVICES=${DEVICE} torchrun --standalone --nnodes 1 --nproc-per-node
   --run_root_dir runs \
   --use_l1_regression True \
   --use_diffusion False \
-  --use_film False \
-  --num_images_in_input 2 \
+  --use_film True \
+  --num_images_in_input 1 \
   --use_proprio True \
   --batch_size 1 \
   --grad_accumulation_steps 4 \
@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=${DEVICE} torchrun --standalone --nnodes 1 --nproc-per-node
   --save_freq 1000 \
   --save_latest_checkpoint_only False \
   --image_aug True \
-  --lora_rank 32 \
+  --lora_rank 16 \
   --wandb_entity robi-ai \
   --wandb_project openvla-oft_ur454 \
   --run_id_note $RUN_ID_NOTE

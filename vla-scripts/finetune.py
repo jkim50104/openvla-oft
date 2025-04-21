@@ -61,6 +61,36 @@ from prismatic.vla.constants import (
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
+
+def export_model_structure(model, output_path="vla_structure.txt", namespace=60):
+    with open(output_path, "w") as f:
+        f.write("📦 VLA Model Architecture Summary\n\n")
+
+        f.write("🔧 MODULE TREE:\n")
+        for name, module in model.named_modules():
+            f.write(f"{name:{namespace}} → {type(module).__name__}\n")
+
+        f.write("\n📐 PARAMETERS:\n")
+        for name, param in model.named_parameters():
+            trainable = "✅" if param.requires_grad else "❌"
+            shape_str = str(list(param.shape))
+            f.write(f"{name:{namespace}} | shape: {shape_str:25} | trainable: {trainable}\n")
+
+
+        if hasattr(model, "print_trainable_parameters"):
+            f.write("\n📊 LoRA Summary:\n")
+            from io import StringIO
+            import sys
+
+            old_stdout = sys.stdout
+            sys.stdout = buffer = StringIO()
+            model.print_trainable_parameters()
+            sys.stdout = old_stdout
+            f.write(buffer.getvalue())
+
+    print(f"✅ Model structure saved to: {output_path}")
+
+
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -846,6 +876,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    export_model_structure(vla, "vla+_before_lora.txt")
 
     # LoRA setup
     if cfg.use_lora:
@@ -875,7 +906,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
-
+    
+    export_model_structure(vla, "vla+_after_lora.txt", 100)
+        
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 

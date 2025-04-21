@@ -152,6 +152,7 @@ runs
 runs/
 experiments/logs/
 third_party/
+vla*.txt
 
 # Rollout videos and wandb logs
 rollouts/
