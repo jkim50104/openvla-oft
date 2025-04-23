@@ -131,7 +131,7 @@ class FinetuneConfig:
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
-    torch_dtype = torch.float32
+    torch_dtype = torch.bfloat16
         
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
@@ -814,7 +814,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_id = get_run_id(cfg)
 
     # Create experiment run directory
-    run_dir = cfg.run_root_dir / run_id
+    run_dir = cfg.run_root_dir / cfg.run_id_note / run_id
     os.makedirs(run_dir, exist_ok=True)
 
     # GPU setup
@@ -930,7 +930,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16=False, # QuadroRTX 8000 does not support bf16
+            to_bf16= (cfg.torch_dtype == torch.bfloat16), # QuadroRTX 8000 does not support bf16
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -946,7 +946,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps": cfg.num_diffusion_steps,
             },
-            to_bf16=False,
+            to_bf16=(cfg.torch_dtype == torch.bfloat16),
         )
         noisy_action_projector = init_module(
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
@@ -1138,7 +1138,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0 and log_step >= cfg.num_steps_before_decay:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,

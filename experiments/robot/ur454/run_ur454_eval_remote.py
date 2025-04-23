@@ -30,6 +30,7 @@ from experiments.robot.ur454.ur454_utils import (
     save_rollout_video,
 )
 from experiments.robot.openvla_utils import (
+    get_action_from_server,
     get_action_head,
     get_noisy_action_projector,
     get_processor,
@@ -213,7 +214,7 @@ def run_episode(
     cfg: GenerateConfig,
     env,
     task_description: str,
-    model, action_head, proprio_projector, noisy_action_projector, processor,
+    server_endpoint: str,
     resize_size,
     log_file=None,
 ):
@@ -282,17 +283,7 @@ def run_episode(
                 # Query model to get action
                 log_message("Requerying model...", log_file)
                 model_query_start_time = time.time()
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                )
+                actions = get_action_from_server(observation, server_endpoint)
                 actions = actions[: cfg.num_open_loop_steps]
                 total_model_query_time += time.time() - model_query_start_time
                 action_queue.extend(actions)
@@ -400,9 +391,6 @@ def eval_ur454(cfg: GenerateConfig) -> None:
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
-    # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
-
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
     
@@ -411,6 +399,9 @@ def eval_ur454(cfg: GenerateConfig) -> None:
 
     # Initialize the UR environment
     env = get_ur_env(cfg)
+    
+    # Get server endpoint for remote inference
+    server_endpoint = get_server_endpoint(cfg)
 
     if cfg.sanity_check:
         ds = tfds.load(cfg.unnorm_key, split='train')
@@ -438,7 +429,7 @@ def eval_ur454(cfg: GenerateConfig) -> None:
         # Run episode
         episode_stats, replay_images, replay_images_resized, replay_images_wrist = (
             run_episode(cfg, env, task_description, 
-                        model, action_head, proprio_projector, noisy_action_projector, processor, 
+                        server_endpoint,
                         resize_size, log_file)
         )
 

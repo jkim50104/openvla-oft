@@ -11,6 +11,9 @@ conda activate openvla-oft
 # Use a command specific to your machine: https://pytorch.org/get-started/locally/
 pip3 install torch torchvision torchaudio
 
+# For Turing A6000, CUDA 12.4, TORCH_CUDA_ARCH_LIST=8.6
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+
 # Clone openvla-oft repo and pip install to download dependencies
 git clone https://github.com/moojink/openvla-oft.git
 cd openvla-oft
