@@ -3,13 +3,13 @@ set -e  # ⬅️ Exit on error
 # export NCCL_P2P_LEVEL=NVL
 
 DEVICE=$1  # e.g., "0" or "0,1" or "1,2,3"
+DEBUG=true
 
 # Dynamically calculate NUM_GPU from DEVICE input
 IFS=',' read -ra GPU_ARRAY <<< "$DEVICE"
 NUM_GPU=${#GPU_ARRAY[@]}
-echo $NUM_GPU
 
-L1=false
+L1=true
 FILM=true
 BATCH_SIZE=8
 
@@ -40,6 +40,11 @@ fi
 
 if [ "$NUM_GPU" -gt 1 ]; then
   RUN_ID_NOTE="M-${RUN_ID_NOTE}"
+fi
+
+# DEBUG overwrite the RUN_ID_NOTE
+if [ "$DEBUG" = true ]; then
+  RUN_ID_NOTE="DEBUG"
 fi
 
 CUDA_VISIBLE_DEVICES=${DEVICE} torchrun --standalone --nnodes 1 --nproc-per-node $NUM_GPU vla-scripts/finetune.py \
