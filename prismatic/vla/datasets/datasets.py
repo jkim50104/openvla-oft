@@ -116,7 +116,7 @@ class RLDSDataset(IterableDataset):
         if "aloha" in self.data_mix:
             load_camera_views = ("primary", "left_wrist", "right_wrist")
         else:
-            load_camera_views = ("primary", "wrist")
+            load_camera_views = ("primary",)
 
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
@@ -125,6 +125,7 @@ class RLDSDataset(IterableDataset):
             load_depth=False,
             load_proprio=True,
             load_language=True,
+            load_seg_mask=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
         rlds_config = dict(

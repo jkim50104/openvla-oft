@@ -47,6 +47,7 @@ def make_dataset_from_rlds(
     depth_obs_keys: Dict[str, Optional[str]] = {},
     state_obs_keys: List[Optional[str]] = (),
     language_key: Optional[str] = None,
+    seg_masks_keys: List[str, str] = None,
     action_proprio_normalization_type: ACTION_PROPRIO_NORMALIZATION_TYPE,
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
@@ -117,6 +118,8 @@ def make_dataset_from_rlds(
         - observation:
             - image_{name1, name2, ...} # RGB image observations
             - depth_{name1, name2, ...} # depth image observations
+            - masks                     # Binary segmentation of objects in main image
+            - masks_id                  # Object labels of each segmentation masks
             - proprio                   # 1-dimensional array of proprioceptive observations
             - timestep                  # timestep of each frame
         - task:
@@ -149,6 +152,12 @@ def make_dataset_from_rlds(
                 new_obs[f"image_{new}"] = old_obs[old]
 
         for new, old in depth_obs_keys.items():
+            if old is None:
+                new_obs[f"depth_{new}"] = tf.repeat("", traj_len)  # padding
+            else:
+                new_obs[f"depth_{new}"] = old_obs[old]
+                
+        for new, old in seg_masks_keys.items():
             if old is None:
                 new_obs[f"depth_{new}"] = tf.repeat("", traj_len)  # padding
             else:
