@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
+from torchvision.transforms import ToTensor
 
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
@@ -32,6 +33,8 @@ class RLDSBatchTransform:
     predict_stop_token: bool = True
     use_wrist_image: bool = False
     use_proprio: bool = False
+    use_seg_masks: bool = False
+    use_robot_mask: bool = True
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -84,9 +87,37 @@ class RLDSBatchTransform:
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+            
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
+            
+        if self.use_seg_masks and "masks" in rlds_batch["observation"] and "masks_id" in rlds_batch["observation"]:
+            masks = rlds_batch["observation"]["masks"][0]          # list of (224, 224) arrays
+            mask_ids = rlds_batch["observation"]["masks_id"][0]    # list of byte strings like b"banana"
+
+            # Optionally remove robot mask
+            if not self.use_robot_mask:
+                filtered = [
+                    (mask, mask_id) for mask, mask_id in zip(masks, mask_ids)
+                    if b"robot" not in mask_id.lower()
+                ]
+                masks, mask_ids = zip(*filtered) if filtered else ([], [])
+
+            # Convert each mask (numpy array) to a torch tensor of shape (1, 224, 224)
+            pixel_values_seg_masks = [torch.from_numpy(mask.copy()).unsqueeze(0).to(torch.bfloat16) for mask in masks]
+
+            # Tokenize each mask label string to tensor of input IDs
+            input_ids_seg_masks = [
+                torch.tensor(self.base_tokenizer(label.decode().lower(), add_special_tokens=True).input_ids)
+                for label in mask_ids
+            ]
+            
+            # Add to return dict
+            return_dict["seg_masks_info"] = dict(
+                pixel_values_seg_masks=pixel_values_seg_masks,
+                input_ids_seg_masks=input_ids_seg_masks
+            )
 
         return return_dict
 
@@ -101,6 +132,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        load_seg_mask: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -125,6 +157,7 @@ class RLDSDataset(IterableDataset):
             load_depth=False,
             load_proprio=True,
             load_language=True,
+            load_seg_mask=load_seg_mask,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
         rlds_config = dict(

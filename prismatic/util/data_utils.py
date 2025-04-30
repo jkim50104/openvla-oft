@@ -102,6 +102,24 @@ class PaddedCollatorForActionPrediction:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        
+        if "seg_masks_info" in instances[0]:
+            pixel_values_seg_masks = [
+                torch.stack(instance["seg_masks_info"]["pixel_values_seg_masks"])
+                for instance in instances]
+            input_ids_seg_masks, attention_mask_seg_masks = [], []
+            for instance in instances:
+                input_ids_seg_masks.append(pad_sequence(instance["seg_masks_info"]["input_ids_seg_masks"], batch_first=True, padding_value=self.pad_token_id))
+                attention_mask_seg_masks.append(input_ids_seg_masks[-1].ne(self.pad_token_id))
+                        
+            seg_masks_info = {
+                "pixel_values_seg_masks": pixel_values_seg_masks,
+                "input_ids_seg_masks": input_ids_seg_masks,
+                "lang_att_mask_seg_masks": attention_mask_seg_masks
+            }
+        else:
+            seg_masks_info = None
+        
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -150,6 +168,7 @@ class PaddedCollatorForActionPrediction:
             attention_mask=attention_mask,
             labels=labels,
             actions=actions,
+            seg_masks_info=seg_masks_info,
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

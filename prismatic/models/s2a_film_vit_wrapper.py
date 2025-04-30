@@ -1,11 +1,12 @@
 """Implementation of additional modules for the VLA's vision transformer."""
 
 from functools import partial
-from typing import Any, Callable, Sequence, Tuple, Union
+from typing import Any, Callable, Sequence, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import VisionTransformer
+from einops.layers.torch import Rearrange
 
 
 class FiLMedVisionTransformerBlock(nn.Module):
@@ -168,7 +169,57 @@ class FiLMedVisionTransformer(VisionTransformer):
         return tuple(outputs)
 
 
-class FiLMedPrismaticVisionBackbone(nn.Module):
+class RGBMFusion(nn.Module):
+    def __init__(self, vis_dim, mask_dim, num_heads=8):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(embed_dim=vis_dim, num_heads=num_heads, batch_first=True)
+        self.query_proj = nn.Linear(mask_dim, vis_dim)
+        self.norm = nn.LayerNorm(vis_dim)
+
+    def forward(self, vision_embeddings, mask_embeddings):
+        queries = self.query_proj(mask_embeddings)
+        attn_output, _ = self.cross_attn(
+            query=queries,
+            key=vision_embeddings,
+            value=vision_embeddings
+        )
+        fused_embeddings = self.norm(vision_embeddings + attn_output)
+        return fused_embeddings
+
+class MaskTransformerEncoder(nn.Module):
+    def __init__(self, hidden_dim, img_size=224, patch_size=14, depth=4, nhead=8):
+        super().__init__()
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(1, hidden_dim, kernel_size=patch_size, stride=patch_size),
+            nn.Flatten(2),
+            Rearrange('b c n -> b n c'),
+            nn.LayerNorm(hidden_dim),
+        )
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, (img_size // patch_size)**2, hidden_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            dim_feedforward=4 * hidden_dim,
+            dropout=0.0,
+            activation=nn.GELU(),
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=depth
+        )
+
+    def forward(self, mask):
+        x = self.patch_embed(mask) + self.pos_embedding
+        mask_embeddings = self.transformer(x)
+        return mask_embeddings
+    
+
+class S2AFiLMedPrismaticVisionBackbone(nn.Module):
     """
     Wrapper for OpenVLA's vision backbone that implements feature-wise linear modulation (FiLM).
 
@@ -179,7 +230,7 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
     def __init__(
         self,
         vision_backbone,
-        llm_dim: int = 4096,  # 4096 for Llama-2 7B
+        llm_dim: int,  # 4096 for Llama-2 7B
     ) -> None:
         """
         Initializes FiLM wrapper.
@@ -191,11 +242,15 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         super().__init__()
         self.vision_backbone = vision_backbone
         self.llm_dim = llm_dim
+        self.vis_dim = self._compute_vis_dim()
 
         # Wrap vision transformers
         self._wrap_vit(self.vision_backbone.featurizer)  # SigLIP
         if self.vision_backbone.use_fused_vision_backbone:
             self._wrap_vit(self.vision_backbone.fused_featurizer)  # DINOv2
+
+        self.mask_encoder = MaskTransformerEncoder(self.vis_dim)
+        self.rgbm_fusion = RGBMFusion(self.vis_dim, self.vis_dim)
 
     def _wrap_vit(self, vit) -> None:
         """
@@ -216,6 +271,16 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         vit.__class__ = FiLMedVisionTransformer
         vit.forward = unpack_tuple(partial(vit.get_intermediate_layers, n={len(vit.blocks) - 2}))
 
+    def _compute_vis_dim(self) -> int:
+        base = self.vision_backbone.get_head_feature_dim()
+        if self._use_fused_vision_backbone():
+            fused = self.vision_backbone.get_fused_head_feature_dim()
+            return base + fused  # 1024 + 1152 = 2176 normally
+        return base
+    
+    def _use_fused_vision_backbone(self):
+        return self.vision_backbone.use_fused_vision_backbone
+
     def get_num_patches(self) -> int:
         """Returns the number of vision patches output by the vision backbone."""
         return self.vision_backbone.get_num_patches()
@@ -228,7 +293,7 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         """Sets the number of input images for the vision backbone."""
         self.vision_backbone.set_num_images_in_input(num_images_in_input)
 
-    def forward(self, pixel_values: torch.Tensor, language_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, language_embeddings: torch.Tensor, seg_masks_info: Dict[str, Any]) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone with FiLM to infuse language inputs into visual features.
 
@@ -241,16 +306,28 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         # For FiLM: Average the language embeddings of the task description
         average_language_embedding = language_embeddings.mean(dim=1)
 
+        # Process mask embeddings
+        merged_mask = torch.stack(
+            [m.float().amax(dim=0,)                             # (1,H,W) per image
+            for m in seg_masks_info["pixel_values_seg_masks"]], #  ↑ logical-OR over Nᵢ
+            dim=0                                               # (B,1,H,W)
+        )
+        mask_embeddings = self.mask_encoder(merged_mask) # (B, 256, vis_dim)
+
         if self.get_num_images_in_input() == 1:
             if not self.vision_backbone.use_fused_vision_backbone:
-                return self.vision_backbone.featurizer(pixel_values, average_language_embedding)
+                rgb_embeddings = self.vision_backbone.featurizer(pixel_values, average_language_embedding)
+                fused_embeddings = self.rgbm_fusion(rgb_embeddings, mask_embeddings)
+                return fused_embeddings
 
-            # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
+            # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> concatenate
             img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
             patches = self.vision_backbone.featurizer(img, average_language_embedding)
             patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
 
-            return torch.cat([patches, patches_fused], dim=2)
+            combined_patches = torch.cat([patches, patches_fused], dim=2)
+            fused_embeddings = self.rgbm_fusion(combined_patches, mask_embeddings)
+            return fused_embeddings
 
         else:
             assert self.vision_backbone.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
@@ -258,23 +335,17 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
             images = torch.split(pixel_values, [6] * self.get_num_images_in_input(), dim=1)
 
-            # Process each image and collect patches
+            # Process each image and collect fused patches
             all_patches = []
             for img in images:
-                # Split each image further into two stacks of channels (each with 3 channels)
                 img_regular, img_fused = torch.split(img, [3, 3], dim=1)
 
-                # Get patches from both SigLIP and DINOv2 vision transformers
                 patches = self.vision_backbone.featurizer(img_regular, average_language_embedding)
                 patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
 
-                # Concatenate SigLIP and DINOv2 patches along the hidden dimension
                 combined_patches = torch.cat([patches, patches_fused], dim=2)
-                all_patches.append(combined_patches)
+                fused_embeddings = self.rgbm_fusion(combined_patches, mask_embeddings)
 
-            # Concatenate all patches along the patch dimension
+                all_patches.append(fused_embeddings)
+
             return torch.cat(all_patches, dim=1)
-
-
-
-

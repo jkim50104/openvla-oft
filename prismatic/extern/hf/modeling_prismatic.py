@@ -164,6 +164,25 @@ class PrismaticVisionBackbone(nn.Module):
             Number of patches per image
         """
         return self.featurizer.patch_embed.num_patches
+    
+    def get_head_feature_dim(self) -> int:
+        """
+        Returns the feature dimension output by the vision backbone.
+
+        Returns:
+            Feature dimension (embedding size) per patch
+        """
+        return self.featurizer.patch_embed.proj.weight.shape[0]
+    
+    def get_fused_head_feature_dim(self) -> int:
+        """
+        Returns the feature dimension output by the vision backbone.
+
+        Returns:
+            Feature dimension (embedding size) per patch
+        """
+        return self.fused_featurizer.patch_embed.proj.weight.shape[0]
+
 
     def get_num_images_in_input(self) -> int:
         """
@@ -435,11 +454,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
+    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False, seg_masks_info=None):
         """Process vision features with optional FiLM conditioning"""
         if use_film:
             # FiLM: Infuse language inputs into visual features
             patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
+        elif seg_masks_info is not None:
+            if language_embeddings is not None:
+                patch_features  = self.vision_backbone(pixel_values, language_embeddings, seg_masks_info)
+            else:
+                if self.vision_backbone.use_mask_token:
+                    patch_features, projected_mask_patch_embeddings  = self.vision_backbone(pixel_values, seg_masks_info)  # (bsz, 256 * num_images, D)
+                    return torch.cat((self.projector(patch_features), projected_mask_patch_embeddings), dim=1)
+                else:
+                    patch_features  = self.vision_backbone(pixel_values, seg_masks_info)  # (bsz, 256 * num_images, D)
         else:
             patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
 
@@ -515,6 +543,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        seg_masks_info: Optional[dict] = None,
+        use_s2a_lang: bool = False,
+        use_s2a_film: bool = False,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -572,18 +603,39 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert past_key_values is None, "Unexpected key `past_key_values` provided during multimodal forward!"
 
             # Get input embeddings (from language model embeddings)
-            input_embeddings = self.get_input_embeddings()(input_ids)  # (B, seq_len, D)
+            input_embeddings = self.get_input_embeddings()(input_ids)  # (B, seq_len) -> (B, seq_len, D)
 
             # Extract action masks
             all_actions_mask = self._process_action_masks(labels)
 
-            # Extract the language portion of the input embeddings (i.e. remove the action tokens portion)
-            language_embeddings = input_embeddings[~all_actions_mask].reshape(
-                input_embeddings.shape[0], -1, input_embeddings.shape[2]
-            )  # (B, lang_seq_len, llm_dim)
+            if use_film:
+                # Extract the language portion of the input embeddings (i.e. remove the action tokens portion)
+                language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                    input_embeddings.shape[0], -1, input_embeddings.shape[2]
+                )  # (B, lang_seq_len, llm_dim)
 
-            # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+                # Get visual features # pixel_values -> (B, image_aug * RGB * num_img, image size, image size) (B, 2 * 3 * num_img, 224, 224)
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings=language_embeddings, use_film=use_film)
+            elif seg_masks_info is not None:
+                if use_s2a_film:
+                    language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                        input_embeddings.shape[0], -1, input_embeddings.shape[2]
+                    )  # (B, lang_seq_len, llm_dim)
+                    
+                    projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings=language_embeddings, seg_masks_info=seg_masks_info)
+                else:
+                    # pixel_values_seg_masks = seg_masks_info["pixel_values_seg_masks"] # (B, mask_len, 1(binary mask channel), image size, image size)
+                    input_ids_seg_masks = seg_masks_info["input_ids_seg_masks"] # (B, mask_len, seq_len)
+                    
+                    # Get seg_masks label embeddings (from language model embeddings)
+                    # (B, mask_len, seq_len) -> (B, mask_len, seq_len, D)
+                    if use_s2a_lang:
+                        seg_masks_info["lang_ebd_seg_masks"] = [self.get_input_embeddings()(input_id_seg_masks) for input_id_seg_masks in input_ids_seg_masks]
+
+                    projected_patch_embeddings = self._process_vision_features(pixel_values, seg_masks_info=seg_masks_info)
+            else:
+                projected_patch_embeddings = self._process_vision_features(pixel_values)
+
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
@@ -954,7 +1006,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         proprio_projector=None,
         action_head=None,
         noisy_action_projector=None,
-        use_film: bool = False,
+        use_film: bool = False,     
+        seg_masks_info: Optional[dict] = None,
+        use_s2a_lang: bool = False,
+        use_s2a_film: bool = False,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -999,13 +1054,32 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         input_embeddings = self.get_input_embeddings()(input_ids)
         all_actions_mask = self._process_action_masks(labels)
 
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~all_actions_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
-        )
-
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        if use_film:
+            # Extract language embeddings
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                input_embeddings.shape[0], -1, input_embeddings.shape[2]
+            )
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings=language_embeddings, use_film=use_film)
+        elif seg_masks_info is not None:                
+            if use_s2a_film:
+                language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                    input_embeddings.shape[0], -1, input_embeddings.shape[2]
+                )  # (B, lang_seq_len, llm_dim)
+                
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings=language_embeddings, seg_masks_info=seg_masks_info)
+            else:
+                # pixel_values_seg_masks = seg_masks_info["pixel_values_seg_masks"] # (B, mask_len, 1(binary mask channel), image size, image size)
+                input_ids_seg_masks = seg_masks_info["input_ids_seg_masks"] # (B, mask_len, seq_len)
+                
+                # Get seg_masks label embeddings (from language model embeddings)
+                # (B, mask_len, seq_len) -> (B, mask_len, seq_len, D)
+                if use_s2a_lang:
+                    seg_masks_info["lang_ebd_seg_masks"] = [self.get_input_embeddings()(input_id_seg_masks) for input_id_seg_masks in input_ids_seg_masks]
+
+                projected_patch_embeddings = self._process_vision_features(pixel_values, seg_masks_info=seg_masks_info)
+        else:
+            projected_patch_embeddings = self._process_vision_features(pixel_values)
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1058,9 +1132,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
         # Unnormalize predicted actions        
-        print("normalized_actions:", normalized_actions)
+        # print("normalized_actions:", normalized_actions)
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
-        print("unnormalized_actions:", normalized_actions)
+        # print("unnormalized_actions:", normalized_actions)
 
         return actions, actions_hidden_states
 

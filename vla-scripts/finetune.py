@@ -40,6 +40,8 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
+from prismatic.models.s2a_film_vit_wrapper import S2AFiLMedPrismaticVisionBackbone
+from prismatic.models.s2a_vit_wrapper import S2APrismaticVisionBackbone
 from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
@@ -113,6 +115,15 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    
+    # S2A
+    use_s2a: bool = False                            # If True, loads segmentation masks for the Seg2Act model
+    use_s2a_fuse: bool = False                   # If True, uses Seg2Act to infust object-level information with segmentation masks and lables at vision backbone level
+    use_s2a_token: bool = False                      # If True, uses Seg2Act to infust object-level information with segmentation masks and lables at token input level
+    use_s2a_film: bool = False
+    use_robot_mask: bool = False
+    use_s2a_lang: bool = False
+    s2a_merge_masks: bool = False
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -149,6 +160,7 @@ class FinetuneConfig:
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
 
     # fmt: on
+    debug: bool = False
 
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
@@ -309,6 +321,9 @@ def run_forward_pass(
     use_diffusion,
     use_proprio,
     use_film,
+    use_s2a,
+    use_s2a_lang,
+    use_s2a_film,
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps=None,
@@ -369,6 +384,9 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
+            seg_masks_info=batch["seg_masks_info"] if use_s2a else None,
+            use_s2a_lang=use_s2a_lang,
+            use_s2a_film=use_s2a_film,
         )
 
     # Get action masks needed for logging
@@ -660,7 +678,7 @@ def save_training_checkpoint(
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
-
+        
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
             torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
@@ -673,7 +691,7 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
-        if cfg.use_film:
+        if cfg.use_film or cfg.use_s2a:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
@@ -755,6 +773,9 @@ def run_validation(
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
+                use_s2a=cfg.use_s2a,
+                use_s2a_lang=cfg.use_s2a_lang,
+                use_s2a_film=cfg.use_s2a_film,
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
@@ -805,7 +826,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
-
+    assert not ((cfg.use_s2a_fuse or cfg.use_s2a_token) and cfg.use_s2a_film), (
+        "Cannot do both S2A and S2A_film. Please pick one of them!"
+    )
+    assert not ((cfg.use_s2a or cfg.use_s2a_film) and cfg.use_film), (
+        "Cannot do both S2A and FiLM. Please pick one of them!"
+    )
+    assert cfg.use_s2a or not (cfg.use_s2a_fuse or cfg.use_s2a_token or cfg.use_s2a_film), "use_s2a must be True when fuse or token is enabled"
+    
+    if cfg.debug:
+        os.environ["WANDB_MODE"] = "offline"
+    
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
@@ -824,7 +855,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.empty_cache()
 
     # Initialize wandb logging
-    if distributed_state.is_main_process:
+    if distributed_state.is_main_process:# and cfg.run_id_note != "DEBUG":
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
 
     # Print detected constants
@@ -876,7 +907,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
-    export_model_structure(vla, "vla+_before_lora.txt")
+    # export_model_structure(vla, "vla+_before_lora.txt")
 
     # LoRA setup
     if cfg.use_lora:
@@ -906,12 +937,38 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+        
+    if cfg.use_s2a_film:
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
+        vla.model.vision_backbone = S2AFiLMedPrismaticVisionBackbone(
+            vision_backbone=vla.model.vision_backbone,
+            llm_dim=vla.llm_dim,
+        )
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
+        if cfg.resume:
+            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            vla.model.vision_backbone.load_state_dict(state_dict)
+        vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+    elif cfg.use_s2a:
+        vla.model.vision_backbone = S2APrismaticVisionBackbone(
+            vision_backbone=vla.model.vision_backbone,
+            llm_dim=vla.llm_dim,
+            use_fuse=cfg.use_s2a_fuse,
+            use_mask_token=cfg.use_s2a_token,
+            use_lang=cfg.use_s2a_lang,
+            merge_masks=cfg.s2a_merge_masks,
+        )
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
+        if cfg.resume:
+            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            vla.model.vision_backbone.load_state_dict(state_dict)
+        vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
     
-    export_model_structure(vla, "vla+_after_lora.txt", 100)
+    # export_model_structure(vla, "vla+_after_lora.txt", 100)
         
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
-
+        
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
         proprio_projector = init_module(
@@ -930,7 +987,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16= (cfg.torch_dtype == torch.bfloat16), # QuadroRTX 8000 does not support bf16
+            to_bf16=(cfg.torch_dtype == torch.bfloat16), # QuadroRTX 8000 does not support bf16
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -954,6 +1011,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    # If we have segementation mask inputs, a segmentation mask embedding is appened to the end of the vision patch embeddings
+    if cfg.use_s2a_token:
+        NUM_PATCHES += vla.module.vision_backbone.get_num_patches()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1004,7 +1064,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
     use_wrist_image = cfg.num_images_in_input > 1
 
-    # Create training and optional validation datasets
+    # Create training and optional validation datasets        
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
@@ -1012,6 +1072,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
+        use_seg_masks=cfg.use_s2a,
+        use_robot_mask=cfg.use_robot_mask
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1020,6 +1082,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        load_seg_mask=cfg.use_s2a,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1029,6 +1092,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             resize_resolution=tuple(vla.module.config.image_sizes),
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
+            load_seg_mask=cfg.use_s2a,
             train=False,
         )
 
@@ -1085,6 +1149,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
+                use_s2a=cfg.use_s2a,
+                use_s2a_lang=cfg.use_s2a_lang,
+                use_s2a_film=cfg.use_s2a_film,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,

@@ -851,6 +851,7 @@ def ur_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -1:]
     
     trajectory = relabel_ur454_actions(trajectory)
+    
     return trajectory
 
 

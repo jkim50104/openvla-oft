@@ -95,5 +95,15 @@ def decode_and_resize(
             depth = dl.transforms.resize_depth_image(depth, size=depth_resize_size[name])
 
         obs[f"depth_{name}"] = depth
+        
+    if "masks" in obs:
+        masks = obs["masks"]
+        
+        target_mask_size = resize_size.get("masks", (224, 224))  # fallback if missing
+        masks = tf.cast(masks, tf.uint8)
+        masks = tf.image.resize(masks[..., tf.newaxis], size=target_mask_size, method="nearest")
+        masks = tf.cast(tf.squeeze(masks, axis=-1), tf.bool)
+
+        obs["masks"] = masks
 
     return obs

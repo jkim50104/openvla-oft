@@ -86,7 +86,7 @@ class OpenVLAServer:
             instruction = observation["instruction"]
 
             action = get_vla_action(
-                self.cfg, self.vla, self.processor, observation, instruction, action_head=self.action_head, proprio_projector=self.proprio_projector, use_film=self.cfg.use_film,
+                self.cfg, self.vla, self.processor, observation, instruction, action_head=self.action_head, proprio_projector=self.proprio_projector, use_film=self.cfg.use_film,                
             )
 
             if double_encode:
@@ -127,6 +127,15 @@ class DeployConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    
+    # S2A
+    use_s2a: bool = False                            # If True, loads segmentation masks for the Seg2Act model
+    use_s2a_fuse: bool = False                   # If True, uses Seg2Act to infust object-level information with segmentation masks and lables at vision backbone level
+    use_s2a_token: bool = False                      # If True, uses Seg2Act to infust object-level information with segmentation masks and lables at token input level
+    use_s2a_film: bool = False
+    use_robot_mask: bool = False
+    use_s2a_lang: bool = False
+    s2a_merge_masks: bool = False
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 25                    # Number of actions to execute open-loop before requerying policy
