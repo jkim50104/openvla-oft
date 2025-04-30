@@ -98,7 +98,7 @@ class GenerateConfig:
     # Note: Setting initial orientation with a 30 degree offset, which makes the robot appear more natural
     init_ee_pos: List[float] = field(default_factory=lambda: [0.105, -0.372, 0.337])
     init_ee_rot: List[float] = field(default_factory=lambda: [-2.203, 2.235, -0.000])
-    init_jpos: List[float] = field(default_factory=lambda: [1.060, -1.411, 1.898, -2.054, -1.564, 4.220])
+    init_jpos: List[float] = field(default_factory=lambda: [1.002, -1.472, 1.926, -2.021, -1.564, 4.162])
 
     camera_topics = ["/cam1/cam1/color/image_raw",
                      "/cam2/cam2/color/image_raw"]
