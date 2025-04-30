@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Union
 import cv2
+from PIL import Image
 import tensorflow_datasets as tfds
 import numpy as np
 
@@ -46,6 +47,10 @@ from experiments.robot.robot_utils import (
 )
 
 from prismatic.vla.constants import PROPRIO_DIM
+
+sys.path.insert(0, "/home/jokim/projects/openvla-oft/third_party/Streaming-Grounded-SAM-2")
+from grounded_sam2 import GroundedSam2Processor
+# from third_party.Streaming-Grounded-SAM-2.grounded_sam2 import GroundedSam2Processor
 
 # Set up logging
 logging.basicConfig(
@@ -209,6 +214,14 @@ def prepare_observation(obs, resize_size):
 
     return observation, img_resized, wrist_img_resized
 
+def process_masks(masks, resize_size=224):
+    return np.stack([
+        np.asarray(
+            Image.fromarray(mask).resize((resize_size, resize_size), Image.LANCZOS)
+        ).astype(bool)
+        for mask in masks
+    ])
+
 
 def run_episode(
     cfg: GenerateConfig,
@@ -217,6 +230,7 @@ def run_episode(
     server_endpoint: str,
     resize_size,
     log_file=None,
+    gs2=None,
 ):
     """Run a single episode in the UR environment."""
     # Define control frequency
@@ -248,6 +262,10 @@ def run_episode(
     episode_start_time = time.time()
     total_model_query_time = 0.0
 
+    if gs2 is not None:
+        gs2.extract_objects(task_description)
+        idx = 0
+
     try:
         while t < cfg.max_steps:
             # Get step start time (used to compute how much to sleep between steps)
@@ -255,6 +273,10 @@ def run_episode(
 
             # Get observation
             obs = env.get_observation()
+            
+            if gs2 is not None:
+                seg_masks_info = gs2.segment_objects(cv2.cvtColor(obs["full_image"], cv2.COLOR_BGR2RGB), idx)
+                idx+=1
 
             if cfg.sanity_check:
                 obs["full_image"] = next(steps)["observation"]["image"].numpy()
@@ -274,6 +296,10 @@ def run_episode(
             if len(action_queue) == 0:
                 # Prepare observation
                 observation, img_resized, wrist_resized = prepare_observation(obs, resize_size)
+                if gs2 is not None:
+                    print(resize_size)       
+                    seg_masks_info["masks"] = process_masks(seg_masks_info["masks"], resize_size)
+                    observation["seg_masks_info"] = seg_masks_info
                 observation["instruction"] = task_description
 
                 # Save processed images for replay
@@ -400,6 +426,9 @@ def eval_ur454(cfg: GenerateConfig) -> None:
     # Initialize the UR environment
     env = get_ur_env(cfg)
     
+    # Initialize Grounded-SAM2 model
+    gs2 = GroundedSam2Processor()
+    
     # Get server endpoint for remote inference
     server_endpoint = get_server_endpoint(cfg)
 
@@ -430,7 +459,8 @@ def eval_ur454(cfg: GenerateConfig) -> None:
         episode_stats, replay_images, replay_images_resized, replay_images_wrist = (
             run_episode(cfg, env, task_description, 
                         server_endpoint,
-                        resize_size, log_file)
+                        resize_size, log_file,
+                        gs2)
         )
 
         # Update counters

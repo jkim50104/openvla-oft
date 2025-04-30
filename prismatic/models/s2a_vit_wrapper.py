@@ -1,236 +1,221 @@
-"""Implementation of additional modules for the VLA's vision transformer."""
+"""Seg‑to‑Act vision backbone with mask‑aware cross‑attention fusion.
 
-from functools import partial
-from typing import Any, Callable, Sequence, Tuple, Union
+Adds a lightweight segmentation branch that turns per‑object masks + language
+embeddings into **mask tokens**, then injects that information into the RGB
+patch tokens through a *single* cross‑attention block (RGB‑M fuse).  Only the
+*first* image is fused when multiple images are provided; other images pass
+through unchanged so the output tensor keeps the same hidden width as the
+original backbone.
+
+The design choices keep every pretrained weight in the RGB ViT intact:
+* global residual add (`rgb + attn_out`) ⇒ identity at initialisation
+* hidden width (`vis_dim`) stays unchanged
+* sequence length increases only when multi‑image inputs are used, exactly as
+  in the original PrismaticVisionBackbone.
+"""
+from typing import Dict, Any
 
 import torch
 import torch.nn as nn
 from einops.layers.torch import Rearrange
-from timm.models.vision_transformer import VisionTransformer
 
+# -----------------------------------------------------------------------------
+# 1.  Mask encoder – per‑object transformer + per‑patch attention pool
+# -----------------------------------------------------------------------------
 
 class PerObjectSemanticEncoder(nn.Module):
-    """Encodes each object's mask along with its semantic embedding."""
+    """Turn a single binary mask + its language embedding into patch tokens."""
 
-    def __init__(self, head_feature_dim, lang_dim):
+    def __init__(self, hidden: int, lang_dim: int,
+                 use_lang):
         super().__init__()
-
+        self.use_lang = use_lang
+            
+        # convert 224×224 → 256 patch tokens of size `hidden`
         self.patch_embed = nn.Sequential(
-            nn.Conv2d(1, head_feature_dim, kernel_size=14, stride=14),
-            nn.Flatten(2),
-            Rearrange('b c n -> b n c'),
-            nn.LayerNorm(head_feature_dim),
+            nn.Conv2d(1, hidden, kernel_size=14, stride=14),
+            nn.Flatten(2),                 # (B,C,256)
+            Rearrange("b c n -> b n c"),  # (B,256,C)
+            nn.LayerNorm(hidden),
         )
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=head_feature_dim,
-            nhead=8,
-            dim_feedforward=head_feature_dim * 4,
-            dropout=0.0,
-            activation=nn.GELU(),
-            batch_first=True,
-            norm_first=True
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden, nhead=8, dim_feedforward=4*hidden,
+                dropout=0.0, activation=nn.GELU(), batch_first=True, norm_first=True
+            ),
+            num_layers=4,
         )
+        if use_lang:
+            self.lang_proj = nn.Linear(lang_dim, hidden, bias=False)
+            self.cross_attn = nn.MultiheadAttention(hidden, 8, batch_first=True)
 
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=head_feature_dim, num_heads=8, batch_first=True)
-        self.lang_proj = nn.Linear(lang_dim, head_feature_dim)
-
-    def forward(self, mask, semantic_embedding):
-        # mask: [B, 1, H, W], semantic_embedding: [B, lang_dim]
-        x = self.patch_embed(mask)  # [B, N_patches, D]
-        x = self.transformer(x)     # [B, N_patches, D]
-
-        lang_context = self.lang_proj(semantic_embedding).unsqueeze(1)  # [B, 1, D]
-
-        enriched_embedding, _ = self.cross_attn(query=lang_context, key=x, value=x)
-        enriched_embedding = enriched_embedding.squeeze(1)  # [B, D]
-
-        return enriched_embedding  # [B, D]
+    def forward(self, mask: torch.Tensor, lang: torch.Tensor=None, attn_mask: torch.Tensor=None) -> torch.Tensor:
+        x = self.patch_embed(mask)                # (B,256,H)
+        x = self.transformer(x)                   # (B,256,H)
+        if self.use_lang:
+            lang = self.lang_proj(lang)               # (B,L,H)
+            x, _ = self.cross_attn(x, lang, lang, key_padding_mask=~attn_mask.bool())
+        return x                              # (B,256,H)
 
 
 class SemanticAttentionPooling(nn.Module):
-    """Pools multiple object embeddings into one fixed-dimensional embedding."""
+    """Pool *N masks* → one token per patch via attention across the N dimension."""
 
-    def __init__(self, embed_dim, output_dim):
+    def __init__(self, hidden: int, heads: int = 8):
         super().__init__()
-        self.query = nn.Parameter(torch.randn(1, 1, output_dim))
-        self.key_proj = nn.Linear(embed_dim, output_dim)
-        self.value_proj = nn.Linear(embed_dim, output_dim)
-        self.softmax = nn.Softmax(dim=-1)
+        self.q = nn.Linear(hidden, hidden)
+        self.k = nn.Linear(hidden, hidden)
+        self.v = nn.Linear(hidden, hidden)
+        self.attn = nn.MultiheadAttention(hidden, heads, batch_first=True)
 
-    def forward(self, object_embeddings):
-        # object_embeddings: [B, N, embed_dim]
-        query = self.query.expand(object_embeddings.size(0), -1, -1)  # [B, 1, output_dim]
-        keys = self.key_proj(object_embeddings)  # [B, N, output_dim]
-        values = self.value_proj(object_embeddings)  # [B, N, output_dim]
-
-        attn_weights = self.softmax(query @ keys.transpose(-2, -1))  # [B, 1, N]
-        pooled_embedding = attn_weights @ values  # [B, 1, output_dim]
-
-        return pooled_embedding.squeeze(1)  # [B, output_dim]
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: (N_mask, 256, H)
+        tokens = tokens.permute(1, 0, 2)          # (256,N,H)
+        q = self.q(tokens.mean(dim=1, keepdim=True))
+        k = self.k(tokens)
+        v = self.v(tokens)
+        pooled, _ = self.attn(q, k, v)            # (256,1,H)
+        return pooled.squeeze(1)                  # (256,H)
 
 
-class Seg2ActWrapper(nn.Module):
-    """Complete wrapper combining RGB embeddings with semantic-aware mask embeddings."""
+class Seg2ActVisionTransformer(nn.Module):
+    """Stack Per‑object encoder + pooling => per‑patch *mask tokens*."""
 
-    def __init__(self, head_feature_dim, lang_dim, final_embed_dim):
+    def __init__(self, hidden: int, lang_dim: int,
+                 use_lang: bool, merge_masks: bool):
         super().__init__()
-        self.object_encoder = PerObjectSemanticEncoder(head_feature_dim, lang_dim)
-        self.attention_pool = SemanticAttentionPooling(head_feature_dim, head_feature_dim)
-        self.final_proj = nn.Linear(head_feature_dim * 2, final_embed_dim)
+        self.merge_masks = merge_masks
+        
+        self.obj_encoder = PerObjectSemanticEncoder(hidden, lang_dim, use_lang)
+        if not merge_masks:
+            self.pool = SemanticAttentionPooling(hidden)
+        
+    def get_num_patches(self) -> int:
+        """Returns the number of vision patches output by the mask encoder."""
+        return self.obj_encoder.patch_embed.num_patches
 
-    def forward(self, rgb_embedding, masks, semantic_embeddings):
-        """
-        Args:
-            rgb_embedding: [B, D_rgb]
-            masks: [B, N, 1, H, W] - N masks per batch
-            semantic_embeddings: [B, N, lang_dim] - N semantic embeddings per batch
-        """
-        B, N = masks.shape[:2]
+    def forward(self, masks, lang=None, att=None):
+        obj_tokens = self.obj_encoder(masks, lang, att)  # (N,256,H)
+        
+        if self.merge_masks:
+            return obj_tokens
+        else:
+            return self.pool(obj_tokens)                     # (256,H)
 
-        object_embeds = []
-        for i in range(N):
-            mask = masks[:, i]  # [B, 1, H, W]
-            sem_emb = semantic_embeddings[:, i]  # [B, lang_dim]
-            obj_embed = self.object_encoder(mask, sem_emb)  # [B, D]
-            object_embeds.append(obj_embed.unsqueeze(1))
+# -----------------------------------------------------------------------------
+# 2.  RGB–Mask fusion via one‑way cross‑attention and residual add
+# -----------------------------------------------------------------------------
 
-        object_embeds = torch.cat(object_embeds, dim=1)  # [B, N, D]
-
-        pooled_semantic_embedding = self.attention_pool(object_embeds)  # [B, D]
-
-        final_visual_embedding = torch.cat([rgb_embedding, pooled_semantic_embedding], dim=-1)  # [B, 2*D]
-        final_embedding = self.final_proj(final_visual_embedding)  # [B, final_embed_dim]
-
-        return final_embedding  # [B, final_embed_dim]
-
-
-def unpack_tuple(fn: Callable[[Any], Tuple[Any]]) -> Callable[[Any], Any]:
-    """Utility function for monkey-patching functions."""
-
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        result = fn(*args, **kwargs)
-        return result[0] if isinstance(result, tuple) else result
-
-    return wrapper
-
-
-class FiLMedVisionTransformer(VisionTransformer):
-    """
-    Wrapper for timm.models.vision_transformer.VisionTransformer that overrides functions to enable infusing language
-    embeddings into visual embeddings via FiLM.
-    """
-
-    def _intermediate_layers(
-        self,
-        x: torch.Tensor,
-        language_embeddings: torch.Tensor,
-        n: Union[int, Sequence] = 1,
-    ):
-        """
-        Copy of timm.models.vision_transformer.VisionTransformer._intermediate_layers() with modifications
-        to take in language embeddings as additional input.
-        """
-        outputs, num_blocks = [], len(self.blocks)
-        take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
-
-        # forward pass
-        x = self.patch_embed(x)
-        x = self._pos_embed(x)
-        x = self.patch_drop(x)
-        x = self.norm_pre(x)
-        for i, blk in enumerate(self.blocks):
-            x = blk(x, language_embeddings)  # Modified to receive language_embeddings
-            if i in take_indices:
-                outputs.append(x)
-
-        return outputs
-
-    def get_intermediate_layers(
-        self,
-        x: torch.Tensor,
-        language_embeddings: torch.Tensor,
-        n: Union[int, Sequence] = 1,
-        reshape: bool = False,
-        return_prefix_tokens: bool = False,
-        norm: bool = False,
-    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
-        """
-        Copy of timm.models.vision_transformer.VisionTransformer.get_intermediate_layers() with modifications
-        to allow language embeddings as additional input.
-        """
-        # take last n blocks if n is an int, if in is a sequence, select by matching indices
-        outputs = self._intermediate_layers(x, language_embeddings, n)
-        if norm:
-            outputs = [self.norm(out) for out in outputs]
-        prefix_tokens = [out[:, 0 : self.num_prefix_tokens] for out in outputs]
-        outputs = [out[:, self.num_prefix_tokens :] for out in outputs]
-
-        if reshape:
-            grid_size = self.patch_embed.grid_size
-            outputs = [
-                out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1, 2).contiguous()
-                for out in outputs
-            ]
-
-        if return_prefix_tokens:
-            return tuple(zip(outputs, prefix_tokens))
-        return tuple(outputs)
-
-
-class FiLMedPrismaticVisionBackbone(nn.Module):
-    """
-    Wrapper for OpenVLA's vision backbone that implements feature-wise linear modulation (FiLM).
-
-    Wraps the Vision Transformers in the vision backbone to enable language conditioning through FiLM.
-    Supports processing 1-3 images using dual vision backbones (SigLIP + DINOv2).
-    """
-
-    def __init__(
-        self,
-        vision_backbone,
-        llm_dim: int = 4096,  # 4096 for Llama-2 7B
-    ) -> None:
-        """
-        Initializes FiLM wrapper.
-
-        Args:
-            vision_backbone (PrismaticVisionBackbone): Base vision backbone.
-            llm_dim (int): Dimension of language model embeddings.
-        """
+class RGBMFuse(nn.Module):
+    def __init__(self, rgb_dim: int, mask_dim: int, heads: int = 8):
         super().__init__()
+        # self.mask_proj = nn.Linear(mask_dim, rgb_dim, bias=False)
+        self.attn = nn.MultiheadAttention(rgb_dim, heads, batch_first=True)
+
+    def forward(self, rgb: torch.Tensor, mask: torch.Tensor, pad: torch.Tensor | None = None):
+        # mask = self.mask_proj(mask)                        # (B,256,D_rgb)
+        out, _ = self.attn(rgb, mask, mask, key_padding_mask=pad)
+        return rgb + out                                   # residual
+
+
+# -----------------------------------------------------------------------------
+# 3.  Mask projector to LLM dimension
+# -----------------------------------------------------------------------------
+class S2AMaskProjector(nn.Module):
+    def __init__(self, use_fused_vision_backbone: bool, vision_dim: int, llm_dim: int) -> None:
+        super().__init__()
+        self.use_fused_vision_backbone = use_fused_vision_backbone
+        self.vision_dim, self.llm_dim = vision_dim, llm_dim
+
+        # Switch on `use_fused_vision_backbone` =>> use slightly different MLPs and projection factors!
+        if not self.use_fused_vision_backbone:
+            self.fc1 = nn.Linear(self.vision_dim, self.llm_dim, bias=True)
+            self.fc2 = nn.Linear(self.llm_dim, self.llm_dim, bias=True)
+            self.act_fn1 = nn.GELU()
+        else:
+            initial_projection_dim = 4 * vision_dim
+            self.fc1 = nn.Linear(self.vision_dim, initial_projection_dim, bias=True)
+            self.fc2 = nn.Linear(initial_projection_dim, self.llm_dim, bias=True)
+            self.fc3 = nn.Linear(self.llm_dim, self.llm_dim, bias=True)
+            self.act_fn1 = nn.GELU()
+            self.act_fn2 = nn.GELU()
+
+    def forward(self, mask_patches: torch.Tensor) -> torch.Tensor:
+        if not self.use_fused_vision_backbone:
+            projected_features = self.fc1(mask_patches)
+            projected_features = self.act_fn1(projected_features)
+            projected_features = self.fc2(projected_features)
+        else:
+            projected_features = self.fc1(mask_patches)
+            projected_features = self.act_fn1(projected_features)
+            projected_features = self.fc2(projected_features)
+            projected_features = self.act_fn2(projected_features)
+            projected_features = self.fc3(projected_features)
+
+        return projected_features
+
+# -----------------------------------------------------------------------------
+# 3.  Prismatic backbone wrapper
+# -----------------------------------------------------------------------------
+
+class S2APrismaticVisionBackbone(nn.Module):
+    """PrismaticVisionBackbone + segmentation goodies.
+
+    Parameters
+    ----------
+    vision_backbone : PrismaticVisionBackbone
+    use_fuse        : if True, inject mask info into the RGB tokens
+    use_mask_token  : if True, return mask tokens projected to `llm_dim`
+
+    **Constraint**
+    --------------
+    At least *one* of the two flags must be **True**.  A `(False, False)`
+    configuration is disallowed because the module would become a no‑op.
+    """
+
+    def __init__(self, vision_backbone, llm_dim: int,
+                 use_fuse: bool, use_mask_token: bool,
+                 use_lang: bool, merge_masks: bool):
+        super().__init__()
+        if not (use_fuse or use_mask_token):
+            raise ValueError(
+                "S2APrismaticVisionBackbone: either `use_fuse` or `use_mask_token` must be True."
+            )
+            
         self.vision_backbone = vision_backbone
         self.llm_dim = llm_dim
+        self.vis_dim = self._compute_vis_dim()
+        
+        self.use_fuse = use_fuse
+        self.use_mask_token = use_mask_token
+        
+        self.use_lang = use_lang
+        self.merge_masks = merge_masks
 
-        # Wrap vision transformers
-        self._wrap_vit(self.vision_backbone.featurizer)  # SigLIP
-        if self.vision_backbone.use_fused_vision_backbone:
-            self._wrap_vit(self.vision_backbone.fused_featurizer)  # DINOv2
+        self.mask_encoder = Seg2ActVisionTransformer(self.vis_dim, llm_dim, use_lang, merge_masks)
+        if use_fuse:
+            self.fuse = RGBMFuse(self.vis_dim, self.vis_dim)
+        if use_mask_token:
+            self.mask_projector = S2AMaskProjector(self._use_fused_vision_backbone, self.vis_dim, self.llm_dim)
+            
 
-    def _wrap_vit(self, vit) -> None:
-        """
-        Creates wrapper around an individual vision transformer to allow for infusion of language inputs.
+    # -------------------------------- private helpers -------------------------
+    def _compute_vis_dim(self) -> int:
+        base = self.vision_backbone.get_head_feature_dim()
+        if self._use_fused_vision_backbone():
+            fused = self.vision_backbone.get_fused_head_feature_dim()
+            return base + fused  # 1024 + 1152 = 2176 normally
+        return base
+    
+    def _use_fused_vision_backbone(self):
+        return self.vision_backbone.use_fused_vision_backbone
+    
 
-        Args:
-            vit (VisionTransformer): Original vision transformer.
-        """
-        # Wrap vision transformer blocks
-        block_wrappers = []
-        for block in vit.blocks:
-            block_wrappers.append(
-                FiLMedVisionTransformerBlock(block=block, vision_dim=vit.num_features, llm_dim=self.llm_dim)
-            )
-        vit.blocks = nn.Sequential(*block_wrappers)
-
-        # Wrap vision transformer with new class that overrides functions used for forward pass
-        vit.__class__ = FiLMedVisionTransformer
-        vit.forward = unpack_tuple(partial(vit.get_intermediate_layers, n={len(vit.blocks) - 2}))
-
+    # --------------------------------  helpers -------------------------------    
     def get_num_patches(self) -> int:
         """Returns the number of vision patches output by the vision backbone."""
         return self.vision_backbone.get_num_patches()
-
+    
     def get_num_images_in_input(self) -> int:
         """Returns the number of input images for the vision backbone."""
         return self.vision_backbone.get_num_images_in_input()
@@ -239,49 +224,50 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         """Sets the number of input images for the vision backbone."""
         self.vision_backbone.set_num_images_in_input(num_images_in_input)
 
-    def forward(self, pixel_values: torch.Tensor, language_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Implements the forward pass for the vision backbone with FiLM to infuse language inputs into visual features.
 
-        Identical to PrismaticVisionBackbone.forward() except that language embeddings are also used as input.
-
-        Args:
-            pixel_values (torch.Tensor): Pixels for input image(s), (B, C, H, W).
-            language_embeddings (torch.Tensor): Language embeddings for the task description, (B, seq_len, llm_dim).
-        """
-        # For FiLM: Average the language embeddings of the task description
-        average_language_embedding = language_embeddings.mean(dim=1)
-
-        if self.get_num_images_in_input() == 1:
-            if not self.vision_backbone.use_fused_vision_backbone:
-                return self.vision_backbone.featurizer(pixel_values, average_language_embedding)
-
-            # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
-            img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-            patches = self.vision_backbone.featurizer(img, average_language_embedding)
-            patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
-
-            return torch.cat([patches, patches_fused], dim=2)
-
+    # ------------------------------ forward -----------------------------------
+    def forward(self, pixel_values: torch.Tensor, seg_masks_info: Dict[str, Any]):
+        # ---- 1. build mask tokens --------------------------------------------
+        if self.merge_masks:
+            merged_mask = torch.stack(
+                [m.float().amax(dim=0,)                             # (1,H,W) per image
+                for m in seg_masks_info["pixel_values_seg_masks"]], #  ↑ logical-OR over Nᵢ
+                dim=0                                               # (B,1,H,W)
+            )
+            mask_tokens = self.mask_encoder(merged_mask) # (B, 256, vis_dim)
         else:
-            assert self.vision_backbone.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
+            mask_tokens = torch.stack([
+                self.mask_encoder(m, l, a)
+                for m, l, a in zip(seg_masks_info["pixel_values_seg_masks"],
+                                seg_masks_info["lang_ebd_seg_masks"],
+                                seg_masks_info["lang_att_mask_seg_masks"])
+            ])  # (B,256,vis_dim)
 
-            # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
-            images = torch.split(pixel_values, [6] * self.get_num_images_in_input(), dim=1)
+        # Optional LLM‑dim projection ------------------------------------------
+        mask_llm = self.mask_projector(mask_tokens) if self.use_mask_token else None
 
-            # Process each image and collect patches
-            all_patches = []
-            for img in images:
-                # Split each image further into two stacks of channels (each with 3 channels)
-                img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+        # ---- 2. build RGB tokens ---------------------------------------------
+        num_imgs = self.get_num_images_in_input()
+        if num_imgs == 1:
+            rgb = self._encode_single(pixel_values)
+            if self.use_fuse:
+                rgb = self.fuse(rgb, mask_tokens)
+            return (rgb, mask_llm) if self.use_mask_token else rgb
 
-                # Get patches from both SigLIP and DINOv2 vision transformers
-                patches = self.vision_backbone.featurizer(img_regular, average_language_embedding)
-                patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
+        # ---- 2b. multi‑image --------------------------------------------------
+        assert self.vision_backbone.use_fused_vision_backbone, "Multi‑image requires fused backbone"
+        chunks = pixel_values.split(6, dim=1)                # list len=num_imgs, each 6‑channel
+        rgb_list = [self._encode_single(c) for c in chunks]
+        if self.use_fuse:
+            rgb_list[0] = self.fuse(rgb_list[0], mask_tokens)  # only first image fused
+        rgb_all = torch.cat(rgb_list, dim=1)                  # (B,256*num_imgs,vis_dim)
+        return (rgb_all, mask_llm) if self.use_mask_token else rgb_all
 
-                # Concatenate SigLIP and DINOv2 patches along the hidden dimension
-                combined_patches = torch.cat([patches, patches_fused], dim=2)
-                all_patches.append(combined_patches)
-
-            # Concatenate all patches along the patch dimension
-            return torch.cat(all_patches, dim=1)
+    # ----------------------------- rgb utility ---------------------------------
+    def _encode_single(self, pixels: torch.Tensor) -> torch.Tensor:
+        if not self._use_fused_vision_backbone:
+            return self.vision_backbone.featurizer(pixels)          # (B,256,1024)
+        img, img_fused = pixels.split([3, 3], dim=1)
+        t1 = self.vision_backbone.featurizer(img)
+        t2 = self.vision_backbone.fused_featurizer(img_fused)
+        return torch.cat([t1, t2], dim=2)                           # (B,256,vis_dim)

@@ -25,7 +25,7 @@ def make_oxe_dataset_kwargs(
     load_depth: bool = False,
     load_proprio: bool = True,
     load_language: bool = True,
-    load_seg_mask: bool = True,
+    load_seg_mask: bool = False,
     action_proprio_normalization_type = ACTION_PROPRIO_NORMALIZATION_TYPE,
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""

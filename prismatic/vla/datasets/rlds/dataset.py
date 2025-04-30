@@ -47,7 +47,7 @@ def make_dataset_from_rlds(
     depth_obs_keys: Dict[str, Optional[str]] = {},
     state_obs_keys: List[Optional[str]] = (),
     language_key: Optional[str] = None,
-    seg_masks_keys: List[str, str] = None,
+    seg_masks_keys: List[Optional[str]] = None,
     action_proprio_normalization_type: ACTION_PROPRIO_NORMALIZATION_TYPE,
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
@@ -129,16 +129,31 @@ def make_dataset_from_rlds(
     """
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
-        REQUIRED_KEYS.add(language_key)
+        REQUIRED_KEYS.add(language_key)        
+    if seg_masks_keys is not None:
+        for key in seg_masks_keys:
+            REQUIRED_KEYS.add(f"observation.{key}")
 
     def restructure(traj):
         # apply a standardization function, if provided
         if standardize_fn is not None:
             traj = standardize_fn(traj)
 
-        if not all(k in traj for k in REQUIRED_KEYS):
+        missing_keys = []
+        for key in REQUIRED_KEYS:
+            if "." in key:
+                # nested key like "observation.masks"
+                outer, inner = key.split(".", 1)
+                if outer not in traj or inner not in traj[outer]:
+                    missing_keys.append(key)
+            else:
+                if key not in traj:
+                    missing_keys.append(key)
+
+        if missing_keys:
             raise ValueError(
-                f"Trajectory is missing keys: {REQUIRED_KEYS - set(traj.keys())}. " "Did you write a `standardize_fn`?"
+                f"Trajectory is missing keys: {missing_keys}. "
+                "Did you write a `standardize_fn`?"
             )
 
         # extracts images, depth images and proprio from the "observation" dict
@@ -156,12 +171,6 @@ def make_dataset_from_rlds(
                 new_obs[f"depth_{new}"] = tf.repeat("", traj_len)  # padding
             else:
                 new_obs[f"depth_{new}"] = old_obs[old]
-                
-        for new, old in seg_masks_keys.items():
-            if old is None:
-                new_obs[f"depth_{new}"] = tf.repeat("", traj_len)  # padding
-            else:
-                new_obs[f"depth_{new}"] = old_obs[old]
 
         if state_obs_keys:
             new_obs["proprio"] = tf.concat(
@@ -175,6 +184,17 @@ def make_dataset_from_rlds(
                 ],
                 axis=1,
             )
+
+        # Load seg masks for Seg2Act
+        if seg_masks_keys:
+            for key in seg_masks_keys:
+                value = old_obs[key]
+
+                # If the value is a RaggedTensor (variable length), convert it to a dense tensor
+                if isinstance(value, tf.RaggedTensor):
+                    value = value.to_tensor()
+
+                new_obs[key] = value
 
         # add timestep info
         new_obs["timestep"] = tf.range(traj_len)

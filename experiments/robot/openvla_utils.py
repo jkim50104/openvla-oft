@@ -26,6 +26,8 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
+from prismatic.models.s2a_vit_wrapper import S2APrismaticVisionBackbone
+from prismatic.models.s2a_film_vit_wrapper import S2AFiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
     ACTION_DIM,
@@ -292,6 +294,12 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
         vla = _apply_film_to_vla(vla, cfg)
+        
+    if cfg.use_s2a:
+        vla = _apply_s2a_to_vla(vla, cfg)
+        
+    if cfg.use_s2a_film:
+        vla = _apply_s2a_film_to_vla(vla, cfg)
 
     # Set number of images in model input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -334,6 +342,94 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
     # Create and apply FiLMed vision backbone
     new_vision_backbone = FiLMedPrismaticVisionBackbone(
         vision_backbone=vla.vision_backbone, llm_dim=vla.llm_dim,
+    )
+    vla.model.vision_backbone = new_vision_backbone
+
+    # Load vision backbone checkpoint
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_backbone")
+    state_dict = torch.load(checkpoint_path, weights_only=True)
+    vla.model.vision_backbone.load_state_dict(state_dict)
+
+    # Use the model component instead of wrapper and convert to bfloat16
+    vla = vla.model
+    vla.vision_backbone = vla.vision_backbone.to(torch.bfloat16)
+
+    return vla
+
+def _apply_s2a_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
+    """
+    Apply S2A (Seg2Act) to the VLA vision backbone.
+
+    Args:
+        vla: The VLA model
+        cfg: Configuration object with model parameters
+
+    Returns:
+        torch.nn.Module: VLA model with FiLM applied
+    """
+    from peft import LoraConfig, get_peft_model
+
+    # Apply LoRA configuration
+    lora_config = LoraConfig(
+        r=32,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        target_modules="all-linear",
+        init_lora_weights="gaussian",
+    )
+    vla = get_peft_model(vla, lora_config)
+
+    # Create and apply S2A vision backbone
+    new_vision_backbone = S2APrismaticVisionBackbone(
+        vision_backbone=vla.vision_backbone,
+        llm_dim=vla.llm_dim,
+        use_fuse=cfg.use_s2a_fuse,
+        use_mask_token=cfg.use_s2a_token,
+        use_lang=cfg.use_s2a_lang,
+        merge_masks=cfg.s2a_merge_masks,
+    )
+    vla.model.vision_backbone = new_vision_backbone
+
+    # Load vision backbone checkpoint
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_backbone")
+    state_dict = torch.load(checkpoint_path, weights_only=True)
+    vla.model.vision_backbone.load_state_dict(state_dict)
+
+    # Use the model component instead of wrapper and convert to bfloat16
+    vla = vla.model
+    vla.vision_backbone = vla.vision_backbone.to(torch.bfloat16)
+
+    return vla
+
+
+def _apply_s2a_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
+    """
+    Apply S2A (Seg2Act) to the VLA vision backbone.
+
+    Args:
+        vla: The VLA model
+        cfg: Configuration object with model parameters
+
+    Returns:
+        torch.nn.Module: VLA model with FiLM applied
+    """
+    from peft import LoraConfig, get_peft_model
+
+    # Apply LoRA configuration
+    lora_config = LoraConfig(
+        r=32,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        target_modules="all-linear",
+        init_lora_weights="gaussian",
+    )
+    vla = get_peft_model(vla, lora_config)
+
+    # Create and apply S2A vision backbone
+    new_vision_backbone = S2AFiLMedPrismaticVisionBackbone(
+        vision_backbone=vla.vision_backbone,
+        llm_dim=vla.llm_dim,
+        use_fuse=cfg.use_s2a_fuse,
     )
     vla.model.vision_backbone = new_vision_backbone
 
@@ -764,6 +860,25 @@ def get_vla_action(
             primary_pixel_values = inputs["pixel_values"]
             all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
             inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+            
+        if cfg.use_s2a:
+            seg_masks_info = obs["seg_masks_info"]
+            pixel_values_seg_masks = [torch.from_numpy(mask.copy()).unsqueeze(0).to(torch.bfloat16) for mask in seg_masks_info["masks"]]
+
+            if not cfg.use_robot_mask:
+                filtered = [
+                    (mask, mask_id) for mask, mask_id in zip(masks, mask_ids)
+                    if b"robot" not in mask_id.lower()
+                ]
+                masks, mask_ids = zip(*filtered) if filtered else ([], [])
+            
+            # Tokenize each mask label string to tensor of input IDs
+            input_ids_seg_masks = [
+                processor(label.decode().lower(), mask).to(DEVICE, dtype=torch.bfloat16)
+                for label, mask in zip(seg_masks_info["mask_ids"], seg_masks_info["masks"])
+            ]
+            
+            seg_masks_info = dict(pixel_values_seg_masks=pixel_values_seg_masks, input_ids_seg_masks=input_ids_seg_masks)
 
         # Process proprioception data if used
         proprio = None
@@ -788,6 +903,8 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                seg_masks_info=seg_masks_info if cfg.use_s2a else None,
+                use_s2a_lang=cfg.use_s2a_lang,
             )
 
     # Extract subset of actions for open loop steps
