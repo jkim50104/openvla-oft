@@ -9,7 +9,7 @@ else
   DIFF=false
 fi
 
-FILM=false
+FILM=true
 
 S2A_fuse=false
 S2A_token=false

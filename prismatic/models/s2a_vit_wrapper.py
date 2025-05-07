@@ -27,7 +27,7 @@ class PerObjectSemanticEncoder(nn.Module):
     """Turn a single binary mask + its language embedding into patch tokens."""
 
     def __init__(self, hidden: int, lang_dim: int,
-                 use_lang):
+                 use_lang,):
         super().__init__()
         self.use_lang = use_lang
             
@@ -38,6 +38,9 @@ class PerObjectSemanticEncoder(nn.Module):
             Rearrange("b c n -> b n c"),  # (B,256,C)
             nn.LayerNorm(hidden),
         )
+        
+        self.pos_embedding = nn.Parameter(torch.randn(1, (224 // 14)**2, hidden))
+        
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden, nhead=8, dim_feedforward=4*hidden,
@@ -50,7 +53,7 @@ class PerObjectSemanticEncoder(nn.Module):
             self.cross_attn = nn.MultiheadAttention(hidden, 8, batch_first=True)
 
     def forward(self, mask: torch.Tensor, lang: torch.Tensor=None, attn_mask: torch.Tensor=None) -> torch.Tensor:
-        x = self.patch_embed(mask)                # (B,256,H)
+        x = self.patch_embed(mask) + self.pos_embedding                # (B,256,H)
         x = self.transformer(x)                   # (B,256,H)
         if self.use_lang:
             lang = self.lang_proj(lang)               # (B,L,H)
@@ -109,13 +112,15 @@ class Seg2ActVisionTransformer(nn.Module):
 class RGBMFuse(nn.Module):
     def __init__(self, rgb_dim: int, mask_dim: int, heads: int = 8):
         super().__init__()
-        # self.mask_proj = nn.Linear(mask_dim, rgb_dim, bias=False)
+        self.mask_proj = nn.Identity()     # does nothing at inference
         self.attn = nn.MultiheadAttention(rgb_dim, heads, batch_first=True)
+        self.norm = nn.LayerNorm(rgb_dim)
 
-    def forward(self, rgb: torch.Tensor, mask: torch.Tensor, pad: torch.Tensor | None = None):
-        # mask = self.mask_proj(mask)                        # (B,256,D_rgb)
-        out, _ = self.attn(rgb, mask, mask, key_padding_mask=pad)
-        return rgb + out                                   # residual
+    def forward(self, rgb_embeddings: torch.Tensor, mask_embeddings: torch.Tensor, pad: torch.Tensor | None = None):
+        mask_embeddings = self.mask_proj(mask_embeddings)                        # (B,256,D_rgb)
+        attn_output, _ = self.attn(rgb_embeddings, mask_embeddings, mask_embeddings)
+        fused_embeddings = self.norm(rgb_embeddings + attn_output) # residual
+        return fused_embeddings                                
 
 
 # -----------------------------------------------------------------------------

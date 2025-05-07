@@ -22,15 +22,16 @@ FILM=false
 
 S2A_fuse=false
 S2A_token=false
+
 S2A_film=true
+
 if [ "$S2A_fuse" = true ] || [ "$S2A_token" = true ] || [ "$S2A_film" = true ]; then
   S2A=true
 else
   S2A=false
 fi
 
-
-S2A_use_robot_mask=true
+S2A_use_robot_mask=false
 S2A_use_lang=false
 S2A_merge_masks=true
 if [ "$S2A_merge_masks" = true ]; then
@@ -63,7 +64,7 @@ fi
 if [ "$S2A_token" = true ]; then
   BATCH_SIZE=$((BATCH_SIZE - 3))
 fi
-if [ "$S2A" = true ] || [ "$S2A_use_lang" = false ] || [ "$S2A_merge_masks" = true ]; then
+if [ "$S2A" = true ] && { [ "$S2A_use_lang" = false ] || [ "$S2A_merge_masks" = true ]; }; then
   BATCH_SIZE=$((BATCH_SIZE + 1))
 fi
 if [ "$DIFF" = true ]; then
